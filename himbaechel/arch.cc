@@ -27,6 +27,7 @@
 #include "placer1.h"
 #include "placer_heap.h"
 #include "placer_static.h"
+#include "placer_liquid.h"
 
 #include "router1.h"
 #include "router2.h"
@@ -279,6 +280,9 @@ bool Arch::place()
         retVal = placer_static(getCtx(), cfg);
     } else if (placer == "sa") {
         retVal = placer1(getCtx(), Placer1Cfg(getCtx()));
+    } else if(placer == "liquid"){
+        LiquidPlacerCfg cfg(getCtx());
+        retVal = placer_liquid(getCtx(), cfg);
     } else {
         log_error("Himbächel architecture does not support placer '%s'\n", placer.c_str());
     }
@@ -409,7 +413,7 @@ void IdString::initialize_arch(const BaseCtx *ctx) {}
 
 const std::string Arch::defaultPlacer = "heap";
 
-const std::vector<std::string> Arch::availablePlacers = {"sa", "heap", "static"};
+const std::vector<std::string> Arch::availablePlacers = {"sa", "heap", "static", "liquid"};
 
 const std::string Arch::defaultRouter = "default";
 const std::vector<std::string> Arch::availableRouters = {"default", "router1", "router2"};

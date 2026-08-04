@@ -1,0 +1,1894 @@
+#include "placer_liquid.h"
+#include <deque>
+#include <queue>
+#include <cmath>
+#include "log.h"
+#include "nextpnr.h"
+#include "fast_bels.h"
+#include "place_common.h"
+#include "array2d.h"
+
+#define HIMBAECHEL_CONSTIDS "uarch/gatemate/constids.inc"
+#include "himbaechel_constids.h"
+
+NEXTPNR_NAMESPACE_BEGIN
+
+namespace{
+    struct ControlSetState
+    {
+        int32_t ctrl_set = -1;
+        int32_t count = 0;
+        void bind(int32_t ctrl_set)
+        {
+            if (count == 0) {
+                this->ctrl_set = ctrl_set;
+            } else {
+                NPNR_ASSERT(this->ctrl_set == ctrl_set);
+            }
+            ++count;
+        }
+        void unbind()
+        {
+            --count;
+            NPNR_ASSERT(count >= 0);
+            if (count == 0)
+                this->ctrl_set = -1;
+        }
+        bool check(int32_t ctrl_set) { return count == 0 || ctrl_set == this->ctrl_set; }
+    };
+}
+
+// This work uses many functions of placer_heap. In general it depends on the paper 'Liquid: High Quality Scalable Placement for Large Heterogeneous FPGAs'
+
+class LiquidPlacer
+{
+  public:
+    LiquidPlacer(Context *ctx, LiquidPlacerCfg cfg): ctx(ctx), cfg(cfg),  fast_bels(ctx, /*check_bel_available=*/true, -1){
+        if(ratio_used_logic_blocks() > 0.8){
+            numIteration = cfg.nOuterDense + 1;
+        }else{
+            numIteration = cfg.nOuterSparse + 1;
+        }
+        learningRate = cfg.learningRateStart;
+        learningRateMultiplier = std::pow(cfg.learningRateStop / cfg.learningRateStart, 1.0 / (numIteration - 1.0));
+        if(ratio_used_logic_blocks() < 0.4){
+            maxConnectionLength = ctx->getGridDimX() * cfg.maxConnLengthRatio;
+        }else{
+            maxConnectionLength = cfg.maxConnLength;
+        }
+        innerItration = cfg.innerItrStart;
+    }
+    
+    //Main Placing-Method
+    bool place(){
+
+      //Start timing
+      
+      //Lock Context 
+      std::unique_lock<Context> lock{*ctx};
+
+      //Place Constraint: nextpnr/docs/constraints.md/##Absolute Placement Constraint
+      place_constraints();
+      //Maybe Heap-Specific. Structure fast_bels is used in spreading and legalisation
+      build_fast_bels();
+      //Alloc control_sets() is maybe Heap-specific. Needed in Heap for Legalisation.
+
+      //Seed placement
+      seed_placement();
+      
+      //Update all chains. Put placed loc of chain-parent to chain-childs
+      update_all_chains();
+
+      //Compute HPWL
+      wirelen_t hpwl = total_hpwl();
+
+      for (int NOuter = 0; NOuter < 4; NOuter++) {
+        setup_solve_cells();
+      }
+
+      
+
+      return true;
+    }
+
+
+
+  private:
+    Context *ctx;
+    LiquidPlacerCfg cfg;
+    //Maybe Heap-Specific
+    int max_x = 0, max_y = 0;
+    
+    //For spreading and legalising. Maybe Heap-Specific
+    FastBels fast_bels;
+    dict<IdString, BoundingBox> constraint_region_bounds;
+    // Tracking control sets
+    array2d<std::vector<ControlSetState>> control_sets;
+    dict<int, int> z_to_ctrl_set;
+    dict<ClusterId, std::vector<CellInfo *>> cluster2cells;
+    dict<IdString, int> cell_ctrl_set;
+    dict<ClusterId, int> chain_size;
+
+    double anchorWeight = 0.0, learningRate, learningRateMultiplier, maxConnectionLength;
+    int numIteration, innerItration;
+    bool legalIsInitialize = false;
+
+    //The solving process of Liquid needs for each cell the folling values in the structure.
+    //These values are used for calculating the gradient of the cells move-vector in the solving-procedure  
+    //A appropriate dict does the mapping to the cells
+    struct EquationValues
+    {
+        double direction;
+        double numPositiveNet, numNegativeNet;
+        double totalPositiveNetSize, totalNegativeNetSize;
+        double momentum, speeds; 
+    };
+    dict<IdString, EquationValues> solve_cells_equations;
+
+    //For the Celltype specific solving is following data-structure needed. It says that a net contains this celltype.
+    dict<IdString, bool> net_has_celltype;
+
+    // In some cases, we can't use bindBel because we allow overlap in the earlier stages. So we use this custom
+    // structure instead
+    struct CellLocation
+    {
+        int x, y;
+        int legal_x, legal_y;
+        double rawx, rawy;
+        bool locked, global;
+    };
+    dict<IdString, CellLocation> cell_locs;
+
+    // The set of cells that we will actually place. This excludes locked cells and children cells of macros/chains
+    // (only the root of each macro is placed.)
+    std::vector<CellInfo *> place_cells;
+
+    // The cells in the current equation being solved (a subset of place_cells in some cases, where we only place
+    // cells of a certain type)
+    std::vector<CellInfo *> solve_cells;
+
+    // Place cells with the BEL attribute set to constrain them
+    void place_constraints()
+    {
+        size_t placed_cells = 0;
+        // Initial constraints placer
+        for (auto &cell_entry : ctx->cells) {
+            CellInfo *cell = cell_entry.second.get();
+            if (cell->isPseudo())
+                continue;
+            auto loc = cell->attrs.find(ctx->id("BEL"));
+            if (loc != cell->attrs.end()) {
+                std::string loc_name = loc->second.as_string();
+                BelId bel = ctx->getBelByNameStr(loc_name);
+                if (bel == BelId()) {
+                    log_error("No Bel named \'%s\' located for "
+                              "this chip (processing BEL attribute on \'%s\')\n",
+                              loc_name.c_str(), cell->name.c_str(ctx));
+                }
+
+                if (!ctx->isValidBelForCellType(cell->type, bel)) {
+                    IdString bel_type = ctx->getBelType(bel);
+                    log_error("Bel \'%s\' of type \'%s\' does not match cell "
+                              "\'%s\' of type \'%s\'\n",
+                              loc_name.c_str(), bel_type.c_str(ctx), cell->name.c_str(ctx), cell->type.c_str(ctx));
+                }
+                auto bound_cell = ctx->getBoundBelCell(bel);
+                if (bound_cell) {
+                    log_error("Cell \'%s\' cannot be bound to bel \'%s\' since it is already bound to cell \'%s\'\n",
+                              cell->name.c_str(ctx), loc_name.c_str(), bound_cell->name.c_str(ctx));
+                }
+
+                ctx->bindBel(bel, cell, STRENGTH_USER);
+                if (!ctx->isBelLocationValid(bel, /* explain_invalid */ true)) {
+                    IdString bel_type = ctx->getBelType(bel);
+                    log_error("Bel \'%s\' of type \'%s\' is not valid for cell "
+                              "\'%s\' of type \'%s\'\n",
+                              loc_name.c_str(), bel_type.c_str(ctx), cell->name.c_str(ctx), cell->type.c_str(ctx));
+                }
+                placed_cells++;
+            }
+        }
+        log_info("Placed %d cells based on constraints.\n", int(placed_cells));
+        ctx->yield();
+    }
+
+    //Init data-object fast_bels and constraint_region_bound which are used in spreading and legalising. Maybe Heap-Specific 
+    void  build_fast_bels()
+    {
+        for (auto bel : ctx->getBels()) {
+            if (!ctx->checkBelAvail(bel))
+                continue;
+            Loc loc = ctx->getBelLocation(bel);
+            max_x = std::max(max_x, loc.x);
+            max_y = std::max(max_y, loc.y);
+        }
+
+        pool<IdString> cell_types_in_use;
+        pool<BelBucketId> buckets_in_use;
+        for (auto &cell : ctx->cells) {
+            if (cell.second->isPseudo())
+                continue;
+            IdString cell_type = cell.second->type;
+            cell_types_in_use.insert(cell_type);
+            BelBucketId bucket = ctx->getBelBucketForCellType(cell_type);
+            buckets_in_use.insert(bucket);
+        }
+
+        for (auto cell_type : cell_types_in_use) {
+            fast_bels.addCellType(cell_type);
+        }
+        for (auto bucket : buckets_in_use) {
+            fast_bels.addBelBucket(bucket);
+        }
+
+        // Determine bounding boxes of region constraints
+        for (auto &region : ctx->region) {
+            Region *r = region.second.get();
+            BoundingBox bb;
+            if (r->constr_bels) {
+                bb.x0 = std::numeric_limits<int>::max();
+                bb.x1 = std::numeric_limits<int>::min();
+                bb.y0 = std::numeric_limits<int>::max();
+                bb.y1 = std::numeric_limits<int>::min();
+                for (auto bel : r->bels) {
+                    Loc loc = ctx->getBelLocation(bel);
+                    bb.x0 = std::min(bb.x0, loc.x);
+                    bb.x1 = std::max(bb.x1, loc.x);
+                    bb.y0 = std::min(bb.y0, loc.y);
+                    bb.y1 = std::max(bb.y1, loc.y);
+                }
+            } else {
+                bb.x0 = 0;
+                bb.y0 = 0;
+                bb.x1 = max_x;
+                bb.y1 = max_y;
+            }
+            constraint_region_bounds[r->name] = bb;
+        }
+    }
+
+    void alloc_control_sets()
+    {
+        if (cfg.ff_bel_bucket == BelBucketId() || cfg.disableCtrlSet)
+            return;
+        FastBels::FastBelsData *ff_bels;
+        fast_bels.getBelsForBelBucket(cfg.ff_bel_bucket, &ff_bels);
+        control_sets.reset(max_x + 1, max_y + 1);
+        for (int x = 0; x <= max_x; x++) {
+            if (x >= int(ff_bels->size()))
+                continue;
+            auto &col = ff_bels->at(x);
+            for (int y = 0; y <= max_y; y++) {
+                if (y < int(col.size()) && !col.at(y).empty())
+                    control_sets.at(x, y).resize(cfg.ff_control_set_groups.size());
+            }
+        }
+        for (int g = 0; g < int(cfg.ff_control_set_groups.size()); g++) {
+            for (int z : cfg.ff_control_set_groups.at(g)) {
+                z_to_ctrl_set[z] = g;
+            }
+        }
+        // determine cell control sets
+        for (const auto &cell : ctx->cells) {
+            const CellInfo *ci = cell.second.get();
+            if (ctx->getBelBucketForCellType(ci->type) != cfg.ff_bel_bucket)
+                continue;
+            auto ctrl_set = cfg.get_cell_control_set(ctx, ci);
+            if (ctrl_set != -1) {
+                cell_ctrl_set[ci->name] = ctrl_set;
+                if (ci->bel != BelId())
+                    bind_ctrl_set(ci->bel, ci->name);
+            }
+        }
+    }
+
+    bool test_ctrl_set(BelId bel, IdString cell)
+    {
+        if (cfg.ff_bel_bucket == BelBucketId() || cfg.disableCtrlSet)
+            return true;
+        if (ctx->getBelBucketForBel(bel) != cfg.ff_bel_bucket)
+            return true;
+        auto loc = ctx->getBelLocation(bel);
+        return control_sets.at(loc.x, loc.y).at(z_to_ctrl_set.at(loc.z)).check(cell_ctrl_set.at(cell));
+    }
+
+    void bind_ctrl_set(BelId bel, IdString cell)
+    {
+        if (cfg.ff_bel_bucket == BelBucketId() || cfg.disableCtrlSet)
+            return;
+        if (ctx->getBelBucketForBel(bel) != cfg.ff_bel_bucket)
+            return;
+        auto loc = ctx->getBelLocation(bel);
+        control_sets.at(loc.x, loc.y).at(z_to_ctrl_set.at(loc.z)).bind(cell_ctrl_set.at(cell));
+    }
+
+    void unbind_ctrl_set(BelId bel)
+    {
+        if (cfg.ff_bel_bucket == BelBucketId() || cfg.disableCtrlSet)
+            return;
+        if (ctx->getBelBucketForBel(bel) != cfg.ff_bel_bucket)
+            return;
+        auto loc = ctx->getBelLocation(bel);
+        auto &tile = control_sets.at(loc.x, loc.y);
+        if (tile.empty())
+            return;
+        auto fnd = z_to_ctrl_set.find(loc.z);
+        if (fnd == z_to_ctrl_set.end())
+            return;
+        tile.at(fnd->second).unbind();
+    }
+
+    // Check if a cell has any meaningful connectivity
+    bool has_connectivity(CellInfo *cell)
+    {
+        for (auto port : cell->ports) {
+            if (port.second.net != nullptr && port.second.net->driver.cell != nullptr &&
+                !port.second.net->users.empty())
+                return true;
+        }
+        return false;
+    }
+
+    // Build up a random initial placement, without regard to legality
+    // FIXME: Are there better approaches to the initial placement (e.g. greedy?)
+    void seed_placement()
+    {
+        pool<IdString> cell_types;
+        for (const auto &cell : ctx->cells) {
+            if (cell.second->isPseudo())
+                continue;
+            cell_types.insert(cell.second->type);
+        }
+
+        pool<BelId> bels_used;
+        dict<IdString, std::deque<BelId>> available_bels;
+
+        for (auto bel : ctx->getBels()) {
+            if (!ctx->checkBelAvail(bel)) {
+                continue;
+            }
+
+            for (auto cell_type : cell_types) {
+                if (ctx->isValidBelForCellType(cell_type, bel)) {
+                    available_bels[cell_type].push_back(bel);
+                }
+            }
+        }
+
+        for (auto &t : available_bels) {
+            ctx->shuffle(t.second.begin(), t.second.end());
+        }
+
+        for (auto &cell : ctx->cells) {
+            CellInfo *ci = cell.second.get();
+            if (ci->isPseudo()) {
+                Loc loc = ci->pseudo_cell->getLocation();
+                cell_locs[cell.first].x = loc.x;
+                cell_locs[cell.first].y = loc.y;
+                cell_locs[cell.first].locked = true;
+                cell_locs[cell.first].global = false;
+                continue;
+            }
+            if (ci->bel != BelId()) {
+                Loc loc = ctx->getBelLocation(ci->bel);
+                cell_locs[cell.first].x = loc.x;
+                cell_locs[cell.first].y = loc.y;
+                cell_locs[cell.first].locked = true;
+                cell_locs[cell.first].global = ctx->getBelGlobalBuf(ci->bel);
+            } else if (ci->cluster == ClusterId() || ctx->getClusterRootCell(ci->cluster) == ci) {
+                bool placed = false;
+                int attempt_count = 0;
+                while (!placed) {
+                    ++attempt_count;
+                    if (attempt_count > 25000) {
+                        log_error("Unable to find a placement location for cell '%s'\n", ci->name.c_str(ctx));
+                    }
+
+                    // Make sure this cell type is in the available BEL map at
+                    // all.
+                    if (!available_bels.count(ci->type)) {
+                        log_error("Unable to place cell '%s', no BELs remaining to implement cell type '%s'\n",
+                                  ci->name.c_str(ctx), ci->type.c_str(ctx));
+                    }
+
+                    // Find an unused BEL from bels_for_cell_type.
+                    auto &bels_for_cell_type = available_bels.at(ci->type);
+                    BelId bel;
+                    while (true) {
+                        if (bels_for_cell_type.empty()) {
+                            log_error("Unable to place cell '%s', no BELs remaining to implement cell type '%s'\n",
+                                      ci->name.c_str(ctx), ci->type.c_str(ctx));
+                        }
+
+                        BelId candidate_bel = bels_for_cell_type.back();
+                        bels_for_cell_type.pop_back();
+                        if (bels_used.count(candidate_bel)) {
+                            // candidate_bel has already been used by another
+                            // cell type, skip it.
+                            continue;
+                        }
+
+                        bel = candidate_bel;
+                        break;
+                    }
+
+                    Loc loc = ctx->getBelLocation(bel);
+                    cell_locs[cell.first].x = loc.x;
+                    cell_locs[cell.first].y = loc.y;
+                    cell_locs[cell.first].locked = false;
+                    cell_locs[cell.first].global = ctx->getBelGlobalBuf(bel);
+
+                    // FIXME
+                    if (has_connectivity(cell.second.get()) && !cfg.ioBufTypes.count(ci->type)) {
+                        bels_used.insert(bel);
+                        place_cells.push_back(ci);
+                        placed = true;
+                    } else {
+                        ctx->bindBel(bel, ci, STRENGTH_STRONG);
+                        bind_ctrl_set(bel, ci->name);
+                        if (ctx->isBelLocationValid(bel)) {
+                            cell_locs[cell.first].locked = true;
+                            placed = true;
+                            bels_used.insert(bel);
+                        } else {
+                            ctx->unbindBel(bel);
+                            unbind_ctrl_set(bel);
+                            available_bels.at(ci->type).push_front(bel);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Setup the cells to be solved, returns the number of rows
+    int setup_solve_cells(pool<BelBucketId> *buckets = nullptr)
+    {
+        int row = 0;
+        solve_cells.clear();
+        // First clear the udata of all cells
+        for (auto &cell : ctx->cells) {
+            cell.second->udata = dont_solve;
+        }
+        // Then update cells to be placed, which excludes cell children
+        for (auto cell : place_cells) {
+            if (buckets && !buckets->count(ctx->getBelBucketForCellType(cell->type)))
+                continue;
+            cell->udata = row++;
+            solve_cells.push_back(cell);
+        }
+        // Finally, update the udata of children
+        for (auto &cluster : cluster2cells)
+            for (auto child : cluster.second)
+                child->udata = ctx->getClusterRootCell(cluster.first)->udata;
+        return row;
+    }
+
+    // Update all chains
+    void update_all_chains()
+    {
+        for (auto cell : place_cells) {
+            chain_size[cell->name] = 1;
+            if (cell->cluster != ClusterId()) {
+                const auto base = cell_locs[cell->name];
+                for (auto child : cluster2cells.at(cell->cluster)) {
+                    if (child != cell)
+                        chain_size[cell->name]++;
+                    Loc offset = ctx->getClusterOffset(child);
+                    cell_locs[child->name].x = std::max(0, std::min(max_x, base.x + offset.x));
+                    cell_locs[child->name].y = std::max(0, std::min(max_y, base.y + offset.y));
+                }
+            }
+        }
+    }
+
+        // This function prepares the equation of each cell for gradient computitation. It's part of the solving step in liquid and depends on build_equations in placer_heap. 
+    void build_cell_equations(bool yaxis){
+        
+        // Return the x or y position of a cell, depending on ydir
+        auto cell_pos = [&](CellInfo *cell) { return yaxis ? cell_locs.at(cell->name).y : cell_locs.at(cell->name).x; };
+        auto legal_pos = [&](CellInfo *cell) {
+            return yaxis ? cell_locs.at(cell->name).legal_y : cell_locs.at(cell->name).legal_x;
+        };
+
+        double coordinate1, coordinate2, netSizeWeight;
+        int cellCount;
+
+        for (auto &net : ctx->nets) {
+            NetInfo *ni = net.second.get();
+            if (ni->driver.cell == nullptr)
+                continue;
+            if (ni->users.empty())
+                continue;
+            if (cell_locs.at(ni->driver.cell->name).global)
+                continue;
+            cellCount = ni->users.entries()+1;
+            netSizeWeight = get_net_size_weight(cellCount);
+            
+            /*
+            // Common is a net of two cells which not needs a bound estimation 
+            if(cellCount == 2){
+                coordinate1 = cell_pos(ni->driver.cell);
+                for (auto usr : ni->users.enumerate()) coordinate2 = cell_pos(usr.value.cell);
+
+
+            }else{*/
+                
+            // Find the bounds of the net in this axis, and the ports that correspond to these bounds
+            PortRef *lbport = nullptr, *ubport = nullptr;
+            int lbpos = std::numeric_limits<int>::max(), ubpos = std::numeric_limits<int>::min();
+            foreach_port(ni, [&](PortRef &port, store_index<PortRef> user_idx) {
+                int pos = cell_pos(port.cell);
+                if (pos < lbpos) {
+                    lbpos = pos;
+                    lbport = &port;
+                }
+                if (pos > ubpos) {
+                    ubpos = pos;
+                    ubport = &port;
+                }
+            });
+            
+            NPNR_ASSERT(lbport != nullptr);
+            NPNR_ASSERT(ubport != nullptr);
+
+            auto stamp_equation = [&](CellInfo &lbcell, CellInfo &ubcell, double weight, bool critical) {
+                double netSize;
+                double coorDiff = cell_pos(&lbcell) - cell_pos(&ubcell);
+                double halfMaxConnLength = cfg.maxConnLength/2;
+                if(critical){
+                    netSize = 2 * (5 * halfMaxConnLength) * coorDiff / (5 * halfMaxConnLength) + coorDiff;
+                }else{
+                    netSize = 2 * halfMaxConnLength * coorDiff / halfMaxConnLength + coorDiff;
+                }
+
+                solve_cells_equations[lbcell.name].totalPositiveNetSize += weight * netSize;
+                solve_cells_equations[lbcell.name].numPositiveNet += weight;
+                solve_cells_equations[lbcell.name].direction += weight;
+                
+                solve_cells_equations[ubcell.name].totalNegativeNetSize += weight * netSize;
+                solve_cells_equations[ubcell.name].numNegativeNet += weight;
+                solve_cells_equations[ubcell.name].direction -= weight;
+            };
+            
+            stamp_equation(*(lbport->cell), *(ubport->cell), netSizeWeight, false); 
+            //}
+            
+        }
+
+    }
+
+    void solve_equations(bool yaxis){
+        // Return the x or y position of a cell, depending on ydir
+        auto cell_pos = [&](CellInfo *cell) { return yaxis ? cell_locs.at(cell->name).y : cell_locs.at(cell->name).x; };
+        std::vector<double> vals;
+        int i = 0;
+        std::transform(solve_cells.begin(), solve_cells.end(), std::back_inserter(vals), cell_pos);
+        for(auto &cell : solve_cells){ 
+            vals.at(i) += solve(cell, vals.at(i), yaxis);
+            i++;
+        }
+        for (size_t i = 0; i < vals.size(); i++)
+            if (yaxis) {
+                cell_locs.at(solve_cells.at(i)->name).rawy = vals.at(i);
+                cell_locs.at(solve_cells.at(i)->name).y = std::min(max_y, std::max(0, int(vals.at(i))));
+                if (solve_cells.at(i)->region != nullptr)
+                    cell_locs.at(solve_cells.at(i)->name).y =
+                            limit_to_reg(solve_cells.at(i)->region, cell_locs.at(solve_cells.at(i)->name).y, true);
+            } else {
+                cell_locs.at(solve_cells.at(i)->name).rawx = vals.at(i);
+                cell_locs.at(solve_cells.at(i)->name).x = std::min(max_x, std::max(0, int(vals.at(i))));
+                if (solve_cells.at(i)->region != nullptr)
+                    cell_locs.at(solve_cells.at(i)->name).x =
+                            limit_to_reg(solve_cells.at(i)->region, cell_locs.at(solve_cells.at(i)->name).x, false);
+            }
+    }
+
+    double solve(CellInfo *currentCell, double currentCoordinate, bool yaxis){
+        auto legal_pos = [&](CellInfo *cell) { return yaxis ? cell_locs.at(cell->name).legal_y : cell_locs.at(cell->name).legal_x; };
+        double  gradient;
+        EquationValues eqVal =  solve_cells_equations.at(currentCell->name); 
+        
+        if(eqVal.direction > 0) {
+            gradient = eqVal.totalPositiveNetSize / eqVal.numPositiveNet;
+        }else if(eqVal.direction < 0){
+            gradient = eqVal.totalNegativeNetSize / eqVal.numNegativeNet;
+        }else{
+            return;
+        }
+        
+        if(legalIsInitialize){
+            gradient = (1 - anchorWeight) * gradient + anchorWeight * (legal_pos(currentCell) - currentCoordinate);
+        }
+        
+        eqVal.momentum = cfg.betaOne * eqVal.momentum + (1 - cfg.betaOne) * gradient;
+        eqVal.speeds = cfg.betaTwo * eqVal.speeds + (1- cfg.betaTwo) * gradient * gradient;
+        return learningRate * eqVal.momentum / (std::sqrt(eqVal.speeds) + cfg.eps);
+    }
+
+    void initializeNOuter(int iteration){
+        if(iteration > 0){
+            anchorWeight  = std::pow((double)iteration / (numIteration - 1.0), cfg.anchorWeightExponent) * anchorWeight;
+            learningRate *= learningRateMultiplier;
+            innerItration = std::max(cfg.innerItrEnd,(int)std::round(innerItration/2));
+        }
+    }
+
+    // Calculate the ratio of used logic blocks. It's the value of 'gamma used' in chapter 'IV. B. Adaptive Maximum Connection Length' of depending paper 
+    double ratio_used_logic_blocks(){
+        int max_logic_bels = 0, used_logic_bels = 0;
+        for (auto bel : ctx->getBels()){
+            if(ctx->getBelBucketForBel(bel) == id_CPE_LT) max_logic_bels++;
+            if(ctx->getBelBucketForBel(bel) == id_CPE_FF) max_logic_bels++;
+        }
+        for (auto cell : place_cells){
+            if(ctx->getBelBucketForBel(cell->bel) == id_CPE_LT) used_logic_bels++;
+            if(ctx->getBelBucketForBel(cell->bel) == id_CPE_FF) used_logic_bels++;
+        }
+        return max_logic_bels / used_logic_bels; 
+    }
+
+    double get_net_size_weight(int size) {
+        switch (size) {
+            case 1:
+            case 2:
+            case 3:  return 1;
+            case 4:  return 1.0828;
+            case 5:  return 1.1536;
+            case 6:  return 1.2206;
+            case 7:  return 1.2823;
+            case 8:  return 1.3385;
+            case 9:  return 1.3991;
+            case 10: return 1.4493;
+            case 11:
+            case 12:
+            case 13:
+            case 14:
+            case 15: return (size-10) * (1.6899-1.4493) / 5 + 1.4493;
+            case 16:
+            case 17:
+            case 18:
+            case 19:
+            case 20: return (size-15) * (1.8924-1.6899) / 5 + 1.6899;
+            case 21:
+            case 22:
+            case 23:
+            case 24:
+            case 25: return (size-20) * (2.0743-1.8924) / 5 + 1.8924;
+            case 26:
+            case 27:
+            case 28:
+            case 29:
+            case 30: return (size-25) * (2.2334-2.0743) / 5 + 2.0743;
+            case 31:
+            case 32:
+            case 33:
+            case 34:
+            case 35: return (size-30) * (2.3895-2.2334) / 5 + 2.2334;
+            case 36:
+            case 37:
+            case 38:
+            case 39:
+            case 40: return (size-35) * (2.5356-2.3895) / 5 + 2.3895;
+            case 41:
+            case 42:
+            case 43:
+            case 44:
+            case 45: return (size-40) * (2.6625-2.5356) / 5 + 2.5356;
+            case 46:
+            case 47:
+            case 48:
+            case 49:
+            case 50: return (size-45) * (2.7933-2.6625) / 5 + 2.6625;
+            default: return (size-50) * 0.02616 + 2.7933;
+        }
+    }
+
+    // Run a function on all ports of a net - including the driver and all users
+    template <typename Tf> void foreach_port(NetInfo *net, Tf func)
+    {
+        if (net->driver.cell != nullptr)
+            func(net->driver, store_index<PortRef>());
+        for (auto usr : net->users.enumerate())
+            func(usr.value, usr.index);
+    }
+
+    // Compute HPWL
+    wirelen_t total_hpwl()
+    {
+        wirelen_t hpwl = 0;
+        for (auto &net : ctx->nets) {
+            NetInfo *ni = net.second.get();
+            if (ni->driver.cell == nullptr)
+                continue;
+            CellLocation &drvloc = cell_locs.at(ni->driver.cell->name);
+            if (drvloc.global)
+                continue;
+            int xmin = drvloc.x, xmax = drvloc.x, ymin = drvloc.y, ymax = drvloc.y;
+            for (auto &user : ni->users) {
+                CellLocation &usrloc = cell_locs.at(user.cell->name);
+                xmin = std::min(xmin, usrloc.x);
+                xmax = std::max(xmax, usrloc.x);
+                ymin = std::min(ymin, usrloc.y);
+                ymax = std::max(ymax, usrloc.y);
+            }
+            hpwl += cfg.hpwl_scale_x * (xmax - xmin) + cfg.hpwl_scale_y * (ymax - ymin);
+        }
+        return hpwl;
+    } 
+
+    template <typename T> T limit_to_reg(Region *reg, T val, bool dir)
+    {
+        if (reg == nullptr)
+            return val;
+        int limit_low = dir ? constraint_region_bounds[reg->name].y0 : constraint_region_bounds[reg->name].x0;
+        int limit_high = dir ? constraint_region_bounds[reg->name].y1 : constraint_region_bounds[reg->name].x1;
+        return std::max<T>(std::min<T>(val, limit_high), limit_low);
+    }
+    
+    
+    struct ChainExtent
+    {
+        int x0, y0, x1, y1;
+    };
+
+    struct SpreaderRegion
+    {
+        int id;
+        int x0, y0, x1, y1;
+        std::vector<int> cells, bels;
+        bool overused(float beta) const
+        {
+            for (size_t t = 0; t < cells.size(); t++) {
+                if (bels.at(t) < 4) {
+                    if (cells.at(t) > bels.at(t))
+                        return true;
+                } else {
+                    if (cells.at(t) > beta * bels.at(t))
+                        return true;
+                }
+            }
+            return false;
+        }
+    };
+
+    class StrictLegaliser
+    {
+      public:
+        StrictLegaliser(LiquidPlacer *p) : p(p), ctx(p->ctx) {};
+
+        void run()
+        {
+            auto startt = std::chrono::high_resolution_clock::now();
+
+            // Unbind all cells placed in this solution
+            for (auto &cell : ctx->cells) {
+                CellInfo *ci = cell.second.get();
+                if (ci->bel != BelId() &&
+                    (ci->udata != dont_solve ||
+                     (ci->cluster != ClusterId() && ctx->getClusterRootCell(ci->cluster)->udata != dont_solve))) {
+                    p->unbind_ctrl_set(ci->bel);
+                    ctx->unbindBel(ci->bel);
+                }
+            }
+
+            // At the moment we don't follow the full HeAP algorithm using cuts for legalisation, instead using
+            // the simple greedy largest-macro-first approach.
+            for (auto cell : p->solve_cells) {
+                remaining.emplace(p->chain_size[cell->name] * p->cfg.get_cell_legalisation_weight(ctx, cell),
+                                  cell->name);
+            }
+            ripup_radius = 2;
+            chain_ripup_radius = std::max(p->max_x, p->max_y); // only ripup chains as last resort
+            total_iters = 0;
+            total_iters_noreset = 0;
+            while (!remaining.empty()) {
+                auto top = remaining.top();
+                remaining.pop();
+
+                CellInfo *ci = ctx->cells.at(top.second).get();
+                // Was now placed, ignore
+                if (ci->bel != BelId())
+                    continue;
+                std::chrono::high_resolution_clock::time_point ci_startt;
+                if (ctx->verbose)
+                    ci_startt = std::chrono::high_resolution_clock::now();
+
+                if (ctx->debug)
+                    log_info("   Legalising %s (%s) priority=%d\n", top.second.c_str(ctx), ci->type.c_str(ctx),
+                             top.first);
+
+                legalise_cell(ci);
+
+                if (ctx->verbose) {
+                    auto ci_endt = std::chrono::high_resolution_clock::now();
+                    p->time_per_cell_type[ci->type] += std::chrono::duration<float>(ci_endt - ci_startt).count();
+                }
+            }
+            auto endt = std::chrono::high_resolution_clock::now();
+            p->sl_time += std::chrono::duration<float>(endt - startt).count();
+        }
+        void legalise_cell(CellInfo *ci)
+        {
+            p->fast_bels.getBelsForCellType(ci->type, &fb);
+            radius = 0;
+            iter = 0;
+            iter_at_radius = 0;
+            total_iters_for_cell = 0;
+            placed = false;
+            bestBel = BelId();
+            best_inp_len = std::numeric_limits<int>::max();
+
+            total_iters++;
+            total_iters_noreset++;
+            if (total_iters > int(p->solve_cells.size())) {
+                total_iters = 0;
+                ripup_radius = std::min(std::max(p->max_x, p->max_y), ripup_radius * 2);
+            }
+
+            if (total_iters_noreset > std::max(5000, 8 * int(ctx->cells.size()))) {
+                log_error("Unable to find legal placement for all cells, design is probably at utilisation limit.\n");
+            }
+
+            if (p->cfg.ff_bel_bucket != BelBucketId() && !p->cfg.disableCtrlSet) {
+                // Try placing based on same control set in window first
+                int32_t ctrl_set = -1;
+                if (ci->cluster != ClusterId()) {
+                    ctrl_set = p->get_cluster_control_set(ci->cluster);
+                } else if (ctx->getBelBucketForCellType(ci->type) == p->cfg.ff_bel_bucket) {
+                    ctrl_set = p->cfg.get_cell_control_set(ctx, ci);
+                }
+                if (ctrl_set != -1) {
+                    int nonempty = 0;
+                    int ctrl_set_radius = p->cfg.ctrl_set_max_radius.at(
+                            std::min(p->iter, int(p->cfg.ctrl_set_max_radius.size()) - 1));
+                    auto candidates =
+                            p->find_control_set_candidates(p->cell_locs.at(ci->name).x, p->cell_locs.at(ci->name).y,
+                                                           ctrl_set, ctrl_set_radius, nonempty);
+                    // log_info("%s %d/%d %d (%d, %d)\n", ci->name.c_str(ctx), int(candidates.size()), nonempty,
+                    // ctrl_set,
+                    //    int(p->cell_locs.at(ci->name).x), int(p->cell_locs.at(ci->name).y));
+                    for (auto loc : candidates) {
+
+                        if (ci->cluster == ClusterId()) {
+                            try_place_cell(ci, loc.x, loc.y, loc.z);
+                        } else {
+                            try_place_cluster(ci, loc.x, loc.y, loc.z);
+                        }
+
+                        if (placed) {
+                            return;
+                        }
+                    }
+                }
+            }
+
+            while (!placed) {
+                if (p->cfg.cell_placement_timeout > 0 && total_iters_for_cell > p->cfg.cell_placement_timeout)
+                    log_error("Unable to find legal placement for cell '%s' of type '%s' after %d attempts, check "
+                              "constraints and "
+                              "utilisation. Use `--placer-heap-cell-placement-timeout` to change the number of "
+                              "attempts.\n",
+                              ctx->nameOf(ci), ci->type.c_str(ctx), total_iters_for_cell);
+                int nx, ny;
+                std::tie(nx, ny) = pick_random_loc_for_cell(ci);
+
+                iter++;
+                iter_at_radius++;
+                if (iter >= (10 * (radius + 1))) {
+                    // No luck yet, increase radius
+                    radius = std::min(std::max(p->max_x, p->max_y), radius + 1);
+                    while (radius < std::max(p->max_x, p->max_y)) {
+                        // Keep increasing the radius until it will actually increase the number of cells we are
+                        // checking (e.g. BRAM and DSP will not be in all cols/rows), so we don't waste effort
+                        for (int x = std::max(0, p->cell_locs.at(ci->name).x - radius);
+                             x <= std::min(p->max_x, p->cell_locs.at(ci->name).x + radius); x++) {
+                            if (x >= int(fb->size()))
+                                break;
+                            for (int y = std::max(0, p->cell_locs.at(ci->name).y - radius);
+                                 y <= std::min(p->max_y, p->cell_locs.at(ci->name).y + radius); y++) {
+                                if (y >= int(fb->at(x).size()))
+                                    break;
+                                if (fb->at(x).at(y).size() > 0)
+                                    goto notempty;
+                            }
+                        }
+                        radius = std::min(std::max(p->max_x, p->max_y), radius + 1);
+                    }
+                notempty:
+                    iter_at_radius = 0;
+                    iter = 0;
+                }
+                // If our randomly chosen cooridnate is out of bounds; or points to a tile with no relevant bels; ignore
+                // it
+                if (nx < 0 || nx > p->max_x)
+                    continue;
+                if (ny < 0 || ny > p->max_y)
+                    continue;
+
+                if (nx >= int(fb->size()))
+                    continue;
+                if (ny >= int(fb->at(nx).size()))
+                    continue;
+                if (fb->at(nx).at(ny).empty())
+                    continue;
+
+                // The number of attempts to find a location to try
+                need_to_explore = 2 * radius;
+
+                // If we have found at least one legal location; and made enough attempts; assume it's good enough and
+                // finish
+                if (iter_at_radius >= need_to_explore && bestBel != BelId()) {
+                    CellInfo *bound = ctx->getBoundBelCell(bestBel);
+                    if (bound != nullptr) {
+                        p->unbind_ctrl_set(bound->bel);
+                        ctx->unbindBel(bound->bel);
+                        remaining.emplace(p->chain_size[bound->name] * p->cfg.get_cell_legalisation_weight(ctx, bound),
+                                          bound->name);
+                    }
+                    p->bind_ctrl_set(bestBel, ci->name);
+                    ctx->bindBel(bestBel, ci, STRENGTH_WEAK);
+                    placed = true;
+                    Loc loc = ctx->getBelLocation(bestBel);
+                    p->cell_locs[ci->name].x = loc.x;
+                    p->cell_locs[ci->name].y = loc.y;
+                    break;
+                }
+
+                if (ci->cluster == ClusterId()) {
+                    try_place_cell(ci, nx, ny);
+                } else {
+                    try_place_cluster(ci, nx, ny);
+                }
+
+                total_iters_for_cell++;
+            }
+        }
+
+      private:
+        LiquidPlacer *p;
+        Context *ctx;
+
+        int ripup_radius, chain_ripup_radius, total_iters, total_iters_noreset;
+
+        FastBels::FastBelsData *fb;
+
+        int radius, iter, iter_at_radius, total_iters_for_cell, need_to_explore;
+        bool placed;
+        BelId bestBel;
+        int best_inp_len;
+
+        typedef decltype(CellInfo::udata) cell_udata_t;
+        cell_udata_t dont_solve = std::numeric_limits<cell_udata_t>::max();
+        std::priority_queue<std::pair<int, IdString>> remaining;
+
+        std::pair<int, int> pick_random_loc_for_cell(CellInfo *ci)
+        {
+            // Determine a search radius around the solver location (which increases over time) that is clamped to
+            // the region constraint for the cell (if applicable)
+            int x0 = std::max(p->cell_locs.at(ci->name).x - radius, 0);
+            int y0 = std::max(p->cell_locs.at(ci->name).y - radius, 0);
+            int x1 = p->cell_locs.at(ci->name).x + radius;
+            int y1 = p->cell_locs.at(ci->name).y + radius;
+
+            if (ci->region != nullptr) {
+                auto &r = p->constraint_region_bounds[ci->region->name];
+                // Clamp search box to a region
+                x0 = std::max(x0, r.x0);
+                y0 = std::max(y0, r.y0);
+                x1 = std::min(x1, r.x1);
+                y1 = std::min(y1, r.y1);
+                if (x0 > x1)
+                    std::swap(x0, x1);
+                if (y0 > y1)
+                    std::swap(y0, y1);
+            }
+
+            // Pick a random X and Y location within our search radius / search box
+            int nx = ctx->rng(x1 - x0 + 1) + x0;
+            int ny = ctx->rng(y1 - y0 + 1) + y0;
+            return std::make_pair(nx, ny);
+        }
+
+        void try_place_cell(CellInfo *ci, int nx, int ny, int ctrl_set_group = -1)
+        {
+            for (auto sz : fb->at(nx).at(ny)) {
+                // Look through all bels in this tile; checking region constraint if applicable
+                if (!ci->testRegion(sz))
+                    continue;
+                if (ctrl_set_group != -1 && p->z_to_ctrl_set.at(ctx->getBelLocation(sz).z) != ctrl_set_group)
+                    continue;
+                if (ctrl_set_group == -1 && !p->test_ctrl_set(sz, ci->name))
+                    continue;
+                // Prefer available bels; unless we are dealing with a wide radius (e.g. difficult control sets)
+                // or occasionally trigger a tiebreaker
+                if (ctx->checkBelAvail(sz) ||
+                    (ctrl_set_group == -1 && (radius > ripup_radius || ctx->rng(20000) < 10))) {
+                    CellInfo *bound = ctx->getBoundBelCell(sz);
+                    if (bound != nullptr) {
+                        // Only rip up cells without constraints
+                        if (bound->cluster != ClusterId() || bound->belStrength > STRENGTH_WEAK)
+                            continue;
+                        ctx->unbindBel(bound->bel);
+                    }
+                    // Provisionally bind the bel
+                    ctx->bindBel(sz, ci, STRENGTH_WEAK);
+                    if (!ctx->isBelLocationValid(sz)) {
+                        // New location is not legal; unbind the cell (and rebind the cell we ripped up if
+                        // applicable)
+                        ctx->unbindBel(sz);
+                        if (bound != nullptr) {
+                            ctx->bindBel(sz, bound, STRENGTH_WEAK);
+                        }
+                    } else if (ctrl_set_group == -1 && iter_at_radius < need_to_explore) {
+                        // It's legal, but we haven't tried enough locations yet
+                        ctx->unbindBel(sz);
+                        if (bound != nullptr) {
+                            ctx->bindBel(sz, bound, STRENGTH_WEAK);
+                        }
+                        int input_len = 0;
+                        // Compute a fast input wirelength metric at this bel; and save if better than our last
+                        // try
+                        for (auto &port : ci->ports) {
+                            auto &pi = port.second;
+                            if (pi.type != PORT_IN || pi.net == nullptr || pi.net->driver.cell == nullptr)
+                                continue;
+                            CellInfo *drv = pi.net->driver.cell;
+                            auto drv_loc = p->cell_locs.find(drv->name);
+                            if (drv_loc == p->cell_locs.end())
+                                continue;
+                            if (drv_loc->second.global)
+                                continue;
+                            input_len += std::abs(drv_loc->second.x - nx) + std::abs(drv_loc->second.y - ny);
+                        }
+                        if (input_len < best_inp_len) {
+                            best_inp_len = input_len;
+                            bestBel = sz;
+                        }
+                        break;
+                    } else {
+                        // It's legal, and we've tried enough. Finish.
+                        if (bound != nullptr) {
+                            p->unbind_ctrl_set(sz);
+                            remaining.emplace(p->chain_size[bound->name] *
+                                                      p->cfg.get_cell_legalisation_weight(ctx, bound),
+                                              bound->name);
+                        }
+                        Loc loc = ctx->getBelLocation(sz);
+                        p->bind_ctrl_set(sz, ci->name);
+                        p->cell_locs[ci->name].x = loc.x;
+                        p->cell_locs[ci->name].y = loc.y;
+                        placed = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        void try_place_cluster(CellInfo *ci, int nx, int ny, int ctrl_set_group = -1)
+        {
+            // We do have relative constraints
+            for (auto sz : fb->at(nx).at(ny)) {
+                // List of cells and their destination
+                std::vector<std::pair<CellInfo *, BelId>> targets;
+                // List of bels we placed things at; and the cell that was there before if applicable
+                dict<BelId, CellInfo *> moves_made;
+
+                if (!ctx->getClusterPlacement(ci->cluster, sz, targets))
+                    continue;
+
+                bool ctrl_set_match = false;
+
+                for (auto &target : targets) {
+                    // Check it satisfies the region constraint if applicable
+                    if (!target.first->testRegion(target.second))
+                        goto fail;
+                    if (ctrl_set_group != -1 && ctx->getBelBucketForBel(target.second) == p->cfg.ff_bel_bucket &&
+                        p->z_to_ctrl_set.at(ctx->getBelLocation(target.second).z) == ctrl_set_group)
+                        ctrl_set_match = true;
+                    CellInfo *bound = ctx->getBoundBelCell(target.second);
+                    // Chains cannot overlap; so if we have to ripup a cell make sure it isn't part of a chain
+                    if (bound != nullptr) {
+                        if (ctrl_set_group != -1)
+                            goto fail;
+                        if (bound->belStrength > (p->cfg.chainRipup ? STRENGTH_STRONG : STRENGTH_WEAK))
+                            goto fail;
+                        if (bound->cluster != ClusterId() && (!p->cfg.chainRipup || radius < chain_ripup_radius))
+                            goto fail;
+                    }
+                }
+
+                if (ctrl_set_group != -1 && !ctrl_set_match)
+                    goto fail;
+
+                // Actually perform the move; keeping track of the moves we make so we can revert them if needed
+                for (auto &target : targets) {
+                    CellInfo *bound = ctx->getBoundBelCell(target.second);
+                    if (bound != nullptr) {
+                        if (bound->cluster != ClusterId()) {
+                            for (auto cell : p->cluster2cells[bound->cluster]) {
+                                if (cell->bel != BelId()) {
+                                    moves_made[cell->bel] = cell;
+                                    ctx->unbindBel(cell->bel);
+                                }
+                            }
+                        } else {
+                            ctx->unbindBel(target.second);
+                        }
+                    }
+                    ctx->bindBel(target.second, target.first, STRENGTH_STRONG);
+                    moves_made[target.second] = bound;
+                }
+                // Check that the move we have made is legal
+                for (auto &move : moves_made) {
+                    if (!ctx->isBelLocationValid(move.first))
+                        goto fail;
+                }
+
+                if (false) {
+                fail:
+                    // If the move turned out to be illegal; revert all the moves we made
+                    for (auto &move : moves_made) {
+                        if (ctx->getBoundBelCell(move.first)) {
+                            ctx->unbindBel(move.first);
+                        }
+                        if (move.second != nullptr) {
+                            ctx->bindBel(move.first, move.second, STRENGTH_WEAK);
+                        }
+                    }
+                    continue;
+                }
+                for (auto &move : moves_made) {
+                    if (move.second)
+                        p->unbind_ctrl_set(move.first);
+                }
+                for (auto &target : targets) {
+                    Loc loc = ctx->getBelLocation(target.second);
+                    p->cell_locs[target.first->name].x = loc.x;
+                    p->cell_locs[target.first->name].y = loc.y;
+                    p->bind_ctrl_set(target.second, target.first->name);
+                    // log_info("%s %d %d %d\n", target.first->name.c_str(ctx), loc.x, loc.y, loc.z);
+                }
+                for (auto &move : moves_made) {
+                    // Where we have ripped up cells; add them to the queue
+                    if (move.second != nullptr && (move.second->cluster == ClusterId() ||
+                                                   ctx->getClusterRootCell(move.second->cluster) == move.second))
+                        remaining.emplace(p->chain_size[move.second->name] *
+                                                  p->cfg.get_cell_legalisation_weight(ctx, move.second),
+                                          move.second->name);
+                }
+
+                placed = true;
+                break;
+            }
+        }
+    };
+
+    class CutSpreader
+    {
+      public:
+        CutSpreader(LiquidPlacer *p, const pool<BelBucketId> &buckets) : p(p), ctx(p->ctx), buckets(buckets)
+        {
+            // Get fast BELs data for all buckets being Cut/Spread.
+            size_t idx = 0;
+            for (BelBucketId bucket : buckets) {
+                type_index[bucket] = idx;
+                FastBels::FastBelsData *fast_bels;
+                p->fast_bels.getBelsForBelBucket(bucket, &fast_bels);
+                fb.push_back(fast_bels);
+                ++idx;
+                NPNR_ASSERT(fb.size() == idx);
+            }
+        }
+        static int seq;
+        void run()
+        {
+            auto startt = std::chrono::high_resolution_clock::now();
+            init();
+            find_overused_regions();
+            for (auto &r : regions) {
+                if (merged_regions.count(r.id))
+                    continue;
+#if 0
+                log_info("%s (%d, %d) |_> (%d, %d) %d/%d\n", beltype.c_str(ctx), r.x0, r.y0, r.x1, r.y1, r.cells,
+                         r.bels);
+#endif
+            }
+            expand_regions();
+            std::queue<std::pair<int, bool>> workqueue;
+#if 0
+            std::vector<std::pair<double, double>> orig;
+            if (ctx->debug)
+                for (auto c : p->solve_cells)
+                    orig.emplace_back(p->cell_locs[c->name].rawx, p->cell_locs[c->name].rawy);
+#endif
+            for (auto &r : regions) {
+                if (merged_regions.count(r.id))
+                    continue;
+#if 0
+                for (auto t : sorted(beltype)) {
+                    log_info("%s (%d, %d) |_> (%d, %d) %d/%d\n", t.c_str(ctx), r.x0, r.y0, r.x1, r.y1,
+                             r.cells.at(type_index.at(t)), r.bels.at(type_index.at(t)));
+                }
+
+#endif
+                workqueue.emplace(r.id, false);
+            }
+            while (!workqueue.empty()) {
+                auto front = workqueue.front();
+                workqueue.pop();
+                auto &r = regions.at(front.first);
+                if (std::all_of(r.cells.begin(), r.cells.end(), [](int x) { return x == 0; }))
+                    continue;
+                auto res = cut_region(r, front.second);
+                if (res) {
+                    workqueue.emplace(res->first, !front.second);
+                    workqueue.emplace(res->second, !front.second);
+                } else {
+                    // Try the other dir, in case stuck in one direction only
+                    auto res2 = cut_region(r, !front.second);
+                    if (res2) {
+                        workqueue.emplace(res2->first, front.second);
+                        workqueue.emplace(res2->second, front.second);
+                    }
+                }
+            }
+#if 0
+            if (ctx->debug) {
+                std::ofstream sp("spread" + std::to_string(seq) + ".csv");
+                for (size_t i = 0; i < p->solve_cells.size(); i++) {
+                    auto &c = p->solve_cells.at(i);
+                    if (c->type != beltype)
+                        continue;
+                    sp << orig.at(i).first << "," << orig.at(i).second << "," << p->cell_locs[c->name].rawx << "," << p->cell_locs[c->name].rawy << std::endl;
+                }
+                std::ofstream oc("cells" + std::to_string(seq) + ".csv");
+                for (size_t y = 0; y <= p->max_y; y++) {
+                    for (size_t x = 0; x <= p->max_x; x++) {
+                        oc << cells_at_location.at(x).at(y).size() << ", ";
+                    }
+                    oc << std::endl;
+                }
+                ++seq;
+            }
+#endif
+            auto endt = std::chrono::high_resolution_clock::now();
+            p->cl_time += std::chrono::duration<float>(endt - startt).count();
+        }
+
+      private:
+        LiquidPlacer *p;
+        Context *ctx;
+        pool<BelBucketId> buckets;
+        dict<BelBucketId, size_t> type_index;
+        std::vector<std::vector<std::vector<int>>> occupancy;
+        std::vector<std::vector<std::vector<int>>> fixed_occupancy;
+
+        std::vector<std::vector<int>> groups;
+        std::vector<std::vector<ChainExtent>> chaines;
+        std::map<IdString, ChainExtent> cell_extents;
+
+        std::vector<std::vector<std::vector<std::vector<BelId>>> *> fb;
+
+        std::vector<SpreaderRegion> regions;
+        pool<int> merged_regions;
+        // Cells at a location, sorted by real (not integer) x and y
+        std::vector<std::vector<std::vector<CellInfo *>>> cells_at_location;
+
+        int occ_at(int x, int y, int type) { return occupancy.at(x).at(y).at(type); }
+
+        int bels_at(int x, int y, int type)
+        {
+            if (x >= int(fb.at(type)->size()) || y >= int(fb.at(type)->at(x).size()))
+                return 0;
+            return std::max(0, int(fb.at(type)->at(x).at(y).size()) - fixed_occupancy.at(x).at(y).at(type));
+        }
+
+        bool is_cell_fixed(const CellInfo &cell) const
+        {
+            return buckets.count(ctx->getBelBucketForCellType(cell.type)) == 0;
+        }
+
+        size_t cell_index(const CellInfo &cell) const { return type_index.at(ctx->getBelBucketForCellType(cell.type)); }
+
+        void init()
+        {
+            occupancy.resize(p->max_x + 1,
+                             std::vector<std::vector<int>>(p->max_y + 1, std::vector<int>(buckets.size(), 0)));
+            fixed_occupancy.resize(p->max_x + 1,
+                                   std::vector<std::vector<int>>(p->max_y + 1, std::vector<int>(buckets.size(), 0)));
+            groups.resize(p->max_x + 1, std::vector<int>(p->max_y + 1, -1));
+            chaines.resize(p->max_x + 1, std::vector<ChainExtent>(p->max_y + 1));
+            cells_at_location.resize(p->max_x + 1, std::vector<std::vector<CellInfo *>>(p->max_y + 1));
+            for (int x = 0; x <= p->max_x; x++)
+                for (int y = 0; y <= p->max_y; y++) {
+                    for (int t = 0; t < int(buckets.size()); t++) {
+                        occupancy.at(x).at(y).at(t) = 0;
+                    }
+                    groups.at(x).at(y) = -1;
+                    chaines.at(x).at(y) = {x, y, x, y};
+                }
+
+            auto set_chain_ext = [&](IdString cell, int x, int y) {
+                if (!cell_extents.count(cell))
+                    cell_extents[cell] = {x, y, x, y};
+                else {
+                    cell_extents[cell].x0 = std::min(cell_extents[cell].x0, x);
+                    cell_extents[cell].y0 = std::min(cell_extents[cell].y0, y);
+                    cell_extents[cell].x1 = std::max(cell_extents[cell].x1, x);
+                    cell_extents[cell].y1 = std::max(cell_extents[cell].y1, y);
+                }
+            };
+
+            for (auto &cell_loc : p->cell_locs) {
+                IdString cell_name = cell_loc.first;
+                const CellInfo &cell = *ctx->cells.at(cell_name);
+                const CellLocation &loc = cell_loc.second;
+                if (is_cell_fixed(cell)) {
+                    continue;
+                }
+
+                if (cell.belStrength > STRENGTH_STRONG) {
+                    continue;
+                }
+                if (cell.cluster != ClusterId() && is_cell_fixed(*ctx->getClusterRootCell(cell.cluster))) {
+                    fixed_occupancy.at(cell_loc.second.x).at(cell_loc.second.y).at(cell_index(cell))++;
+                } else {
+                    occupancy.at(cell_loc.second.x).at(cell_loc.second.y).at(cell_index(cell))++;
+                }
+
+                // Compute ultimate extent of each chain root
+                if (cell.cluster != ClusterId()) {
+                    set_chain_ext(ctx->getClusterRootCell(cell.cluster)->name, loc.x, loc.y);
+                }
+            }
+
+            for (auto &cell_loc : p->cell_locs) {
+                IdString cell_name = cell_loc.first;
+                const CellInfo &cell = *ctx->cells.at(cell_name);
+                const CellLocation &loc = cell_loc.second;
+                if (is_cell_fixed(cell)) {
+                    continue;
+                }
+
+                if (cell.belStrength > STRENGTH_STRONG) {
+                    continue;
+                }
+
+                // Transfer chain extents to the actual chains structure
+                ChainExtent *ce = nullptr;
+                if (cell.cluster != ClusterId()) {
+                    ce = &(cell_extents.at(ctx->getClusterRootCell(cell.cluster)->name));
+                }
+
+                if (ce) {
+                    auto &lce = chaines.at(loc.x).at(loc.y);
+                    lce.x0 = std::min(lce.x0, ce->x0);
+                    lce.y0 = std::min(lce.y0, ce->y0);
+                    lce.x1 = std::max(lce.x1, ce->x1);
+                    lce.y1 = std::max(lce.y1, ce->y1);
+                }
+            }
+
+            for (auto cell : p->solve_cells) {
+                if (is_cell_fixed(*cell)) {
+                    continue;
+                }
+
+                cells_at_location.at(p->cell_locs.at(cell->name).x).at(p->cell_locs.at(cell->name).y).push_back(cell);
+            }
+        }
+
+        void merge_regions(SpreaderRegion &merged, SpreaderRegion &mergee)
+        {
+            // Prevent grow_region from recursing while doing this
+            for (int x = mergee.x0; x <= mergee.x1; x++) {
+                for (int y = mergee.y0; y <= mergee.y1; y++) {
+                    // log_info("%d %d\n", groups.at(x).at(y), mergee.id);
+                    NPNR_ASSERT(groups.at(x).at(y) == mergee.id);
+                    groups.at(x).at(y) = merged.id;
+                    for (size_t t = 0; t < buckets.size(); t++) {
+                        merged.cells.at(t) += occ_at(x, y, t);
+                        merged.bels.at(t) += bels_at(x, y, t);
+                    }
+                }
+            }
+
+            merged_regions.insert(mergee.id);
+            grow_region(merged, mergee.x0, mergee.y0, mergee.x1, mergee.y1);
+        }
+
+        void grow_region(SpreaderRegion &r, int x0, int y0, int x1, int y1, bool init = false)
+        {
+            // log_info("growing to (%d, %d) |_> (%d, %d)\n", x0, y0, x1, y1);
+            if ((x0 >= r.x0 && y0 >= r.y0 && x1 <= r.x1 && y1 <= r.y1) || init)
+                return;
+            int old_x0 = r.x0 + (init ? 1 : 0), old_y0 = r.y0, old_x1 = r.x1, old_y1 = r.y1;
+            r.x0 = std::min(r.x0, x0);
+            r.y0 = std::min(r.y0, y0);
+            r.x1 = std::max(r.x1, x1);
+            r.y1 = std::max(r.y1, y1);
+
+            auto process_location = [&](int x, int y) {
+                // Merge with any overlapping regions
+                if (groups.at(x).at(y) == -1) {
+                    for (size_t t = 0; t < buckets.size(); t++) {
+                        r.bels.at(t) += bels_at(x, y, t);
+                        r.cells.at(t) += occ_at(x, y, t);
+                    }
+                }
+
+                if (groups.at(x).at(y) != -1 && groups.at(x).at(y) != r.id)
+                    merge_regions(r, regions.at(groups.at(x).at(y)));
+                groups.at(x).at(y) = r.id;
+                // Grow to cover any chains
+                auto &chaine = chaines.at(x).at(y);
+                grow_region(r, chaine.x0, chaine.y0, chaine.x1, chaine.y1);
+            };
+            for (int x = r.x0; x < old_x0; x++)
+                for (int y = r.y0; y <= r.y1; y++)
+                    process_location(x, y);
+            for (int x = old_x1 + 1; x <= x1; x++)
+                for (int y = r.y0; y <= r.y1; y++)
+                    process_location(x, y);
+            for (int y = r.y0; y < old_y0; y++)
+                for (int x = r.x0; x <= r.x1; x++)
+                    process_location(x, y);
+            for (int y = old_y1 + 1; y <= r.y1; y++)
+                for (int x = r.x0; x <= r.x1; x++)
+                    process_location(x, y);
+        }
+
+        void find_overused_regions()
+        {
+            for (int x = 0; x <= p->max_x; x++)
+                for (int y = 0; y <= p->max_y; y++) {
+                    // Either already in a group, or not overutilised. Ignore
+                    if (groups.at(x).at(y) != -1)
+                        continue;
+                    bool overutilised = false;
+                    for (size_t t = 0; t < buckets.size(); t++) {
+                        if (occ_at(x, y, t) > bels_at(x, y, t)) {
+                            overutilised = true;
+                            break;
+                        }
+                    }
+
+                    if (!overutilised)
+                        continue;
+                    // log_info("%d %d %d\n", x, y, occ_at(x, y));
+                    int id = int(regions.size());
+                    groups.at(x).at(y) = id;
+                    SpreaderRegion reg;
+                    reg.id = id;
+                    reg.x0 = reg.x1 = x;
+                    reg.y0 = reg.y1 = y;
+                    for (size_t t = 0; t < buckets.size(); t++) {
+                        reg.bels.push_back(bels_at(x, y, t));
+                        reg.cells.push_back(occ_at(x, y, t));
+                    }
+                    // Make sure we cover carries, etc
+                    grow_region(reg, reg.x0, reg.y0, reg.x1, reg.y1, true);
+
+                    bool expanded = true;
+                    while (expanded) {
+                        expanded = false;
+                        // Keep trying expansion in x and y, until we find no over-occupancy cells
+                        // or hit grouped cells
+
+                        // First try expanding in x
+                        if (reg.x1 < p->max_x) {
+                            bool over_occ_x = false;
+                            for (int y1 = reg.y0; y1 <= reg.y1; y1++) {
+                                for (size_t t = 0; t < buckets.size(); t++) {
+                                    if (occ_at(reg.x1 + 1, y1, t) > bels_at(reg.x1 + 1, y1, t)) {
+                                        over_occ_x = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (over_occ_x) {
+                                expanded = true;
+                                grow_region(reg, reg.x0, reg.y0, reg.x1 + 1, reg.y1);
+                            }
+                        }
+
+                        if (reg.y1 < p->max_y) {
+                            bool over_occ_y = false;
+                            for (int x1 = reg.x0; x1 <= reg.x1; x1++) {
+                                for (size_t t = 0; t < buckets.size(); t++) {
+                                    if (occ_at(x1, reg.y1 + 1, t) > bels_at(x1, reg.y1 + 1, t)) {
+                                        over_occ_y = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (over_occ_y) {
+                                expanded = true;
+                                grow_region(reg, reg.x0, reg.y0, reg.x1, reg.y1 + 1);
+                            }
+                        }
+                    }
+                    regions.push_back(reg);
+                }
+        }
+
+        void expand_regions()
+        {
+            std::queue<int> overu_regions;
+            float beta = p->cfg.beta;
+            for (auto &r : regions) {
+                if (!merged_regions.count(r.id) && r.overused(beta))
+                    overu_regions.push(r.id);
+            }
+            while (!overu_regions.empty()) {
+                int rid = overu_regions.front();
+                overu_regions.pop();
+                if (merged_regions.count(rid))
+                    continue;
+                auto &reg = regions.at(rid);
+                while (reg.overused(beta)) {
+                    bool changed = false;
+                    for (int j = 0; j < p->cfg.spread_scale_x; j++) {
+                        if (reg.x0 > 0) {
+                            grow_region(reg, reg.x0 - 1, reg.y0, reg.x1, reg.y1);
+                            changed = true;
+                            if (!reg.overused(beta))
+                                break;
+                        }
+                        if (reg.x1 < p->max_x) {
+                            grow_region(reg, reg.x0, reg.y0, reg.x1 + 1, reg.y1);
+                            changed = true;
+                            if (!reg.overused(beta))
+                                break;
+                        }
+                    }
+                    for (int j = 0; j < p->cfg.spread_scale_y; j++) {
+                        if (reg.y0 > 0) {
+                            grow_region(reg, reg.x0, reg.y0 - 1, reg.x1, reg.y1);
+                            changed = true;
+                            if (!reg.overused(beta))
+                                break;
+                        }
+                        if (reg.y1 < p->max_y) {
+                            grow_region(reg, reg.x0, reg.y0, reg.x1, reg.y1 + 1);
+                            changed = true;
+                            if (!reg.overused(beta))
+                                break;
+                        }
+                    }
+                    if (!changed) {
+                        for (auto bucket : buckets) {
+                            if (reg.cells > reg.bels) {
+                                IdString bucket_name = ctx->getBelBucketName(bucket);
+                                log_error("Failed to expand region (%d, %d) |_> (%d, %d) of %d %ss\n", reg.x0, reg.y0,
+                                          reg.x1, reg.y1, reg.cells.at(type_index.at(bucket)), bucket_name.c_str(ctx));
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Implementation of the recursive cut-based spreading as described in the HeAP paper
+        // Note we use "left" to mean "-x/-y" depending on dir and "right" to mean "+x/+y" depending on dir
+
+        std::vector<CellInfo *> cut_cells;
+
+        boost::optional<std::pair<int, int>> cut_region(SpreaderRegion &r, bool dir)
+        {
+            cut_cells.clear();
+            auto &cal = cells_at_location;
+            int total_cells = 0;
+            for (int x = r.x0; x <= r.x1; x++) {
+                for (int y = r.y0; y <= r.y1; y++) {
+                    std::copy(cal.at(x).at(y).begin(), cal.at(x).at(y).end(), std::back_inserter(cut_cells));
+                }
+            }
+            for (auto &cell : cut_cells) {
+                total_cells += p->chain_size.count(cell->name) ? p->chain_size.at(cell->name) : 1;
+            }
+            std::sort(cut_cells.begin(), cut_cells.end(), [&](const CellInfo *a, const CellInfo *b) {
+                return dir ? (p->cell_locs.at(a->name).rawy < p->cell_locs.at(b->name).rawy)
+                           : (p->cell_locs.at(a->name).rawx < p->cell_locs.at(b->name).rawx);
+            });
+
+            if (cut_cells.size() < 2)
+                return {};
+            // Find the cells midpoint, counting chains in terms of their total size - making the initial source cut
+            int pivot_cells = 0;
+            int pivot = 0;
+            for (auto &cell : cut_cells) {
+                pivot_cells += p->chain_size.count(cell->name) ? p->chain_size.at(cell->name) : 1;
+                if (pivot_cells >= total_cells / 2)
+                    break;
+                pivot++;
+            }
+            if (pivot >= int(cut_cells.size())) {
+                pivot = int(cut_cells.size()) - 1;
+            }
+            // log_info("orig pivot %d/%d lc %d rc %d\n", pivot, int(cut_cells.size()), pivot_cells, total_cells -
+            // pivot_cells);
+
+            // Find the clearance required either side of the pivot
+            int clearance_l = 0, clearance_r = 0;
+            for (size_t i = 0; i < cut_cells.size(); i++) {
+                int size;
+                if (cell_extents.count(cut_cells.at(i)->name)) {
+                    auto &ce = cell_extents.at(cut_cells.at(i)->name);
+                    size = dir ? (ce.y1 - ce.y0 + 1) : (ce.x1 - ce.x0 + 1);
+                } else {
+                    size = 1;
+                }
+                if (int(i) < pivot)
+                    clearance_l = std::max(clearance_l, size);
+                else
+                    clearance_r = std::max(clearance_r, size);
+            }
+            // Find the target cut that minimises difference in utilisation, whilst trying to ensure that all chains
+            // still fit
+
+            // First trim the boundaries of the region in the axis-of-interest, skipping any rows/cols without any
+            // bels of the appropriate type
+            int trimmed_l = dir ? r.y0 : r.x0, trimmed_r = dir ? r.y1 : r.x1;
+            while (trimmed_l < (dir ? r.y1 : r.x1)) {
+                bool have_bels = false;
+                for (int i = dir ? r.x0 : r.y0; i <= (dir ? r.x1 : r.y1); i++) {
+                    for (size_t t = 0; t < buckets.size(); t++) {
+                        if (bels_at(dir ? i : trimmed_l, dir ? trimmed_l : i, t) > 0) {
+                            have_bels = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (have_bels)
+                    break;
+
+                trimmed_l++;
+            }
+            while (trimmed_r > (dir ? r.y0 : r.x0)) {
+                bool have_bels = false;
+                for (int i = dir ? r.x0 : r.y0; i <= (dir ? r.x1 : r.y1); i++) {
+                    for (size_t t = 0; t < buckets.size(); t++) {
+                        if (bels_at(dir ? i : trimmed_r, dir ? trimmed_r : i, t) > 0) {
+                            have_bels = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (have_bels)
+                    break;
+
+                trimmed_r--;
+            }
+            // log_info("tl %d tr %d cl %d cr %d\n", trimmed_l, trimmed_r, clearance_l, clearance_r);
+            if ((trimmed_r - trimmed_l + 1) <= std::max(clearance_l, clearance_r))
+                return {};
+            // Now find the initial target cut that minimises utilisation imbalance, whilst
+            // meeting the clearance requirements for any large macros
+            std::vector<int> left_cells_v(buckets.size(), 0), right_cells_v(buckets.size(), 0);
+            std::vector<int> left_bels_v(buckets.size(), 0), right_bels_v(r.bels);
+            for (int i = 0; i <= pivot; i++)
+                left_cells_v.at(cell_index(*cut_cells.at(i))) +=
+                        p->chain_size.count(cut_cells.at(i)->name) ? p->chain_size.at(cut_cells.at(i)->name) : 1;
+            for (int i = pivot + 1; i < int(cut_cells.size()); i++)
+                right_cells_v.at(cell_index(*cut_cells.at(i))) +=
+                        p->chain_size.count(cut_cells.at(i)->name) ? p->chain_size.at(cut_cells.at(i)->name) : 1;
+
+            int best_tgt_cut = -1;
+            double best_deltaU = std::numeric_limits<double>::max();
+            // std::pair<int, int> target_cut_bels;
+            std::vector<int> slither_bels(buckets.size(), 0);
+            for (int i = trimmed_l; i <= trimmed_r; i++) {
+                for (size_t t = 0; t < buckets.size(); t++)
+                    slither_bels.at(t) = 0;
+                for (int j = dir ? r.x0 : r.y0; j <= (dir ? r.x1 : r.y1); j++) {
+                    for (size_t t = 0; t < buckets.size(); t++)
+                        slither_bels.at(t) += dir ? bels_at(j, i, t) : bels_at(i, j, t);
+                }
+                for (size_t t = 0; t < buckets.size(); t++) {
+                    left_bels_v.at(t) += slither_bels.at(t);
+                    right_bels_v.at(t) -= slither_bels.at(t);
+                }
+
+                if (((i - trimmed_l) + 1) >= clearance_l && ((trimmed_r - i) + 1) >= clearance_r) {
+                    // Solution is potentially valid
+                    double aU = 0;
+                    for (size_t t = 0; t < buckets.size(); t++)
+                        aU += (left_cells_v.at(t) + right_cells_v.at(t)) *
+                              std::abs(double(left_cells_v.at(t)) / double(std::max(left_bels_v.at(t), 1)) -
+                                       double(right_cells_v.at(t)) / double(std::max(right_bels_v.at(t), 1)));
+                    if (aU < best_deltaU) {
+                        best_deltaU = aU;
+                        best_tgt_cut = i;
+                    }
+                }
+            }
+            if (best_tgt_cut == -1)
+                return {};
+            // left_bels = target_cut_bels.first;
+            // right_bels = target_cut_bels.second;
+            for (size_t t = 0; t < buckets.size(); t++) {
+                left_bels_v.at(t) = 0;
+                right_bels_v.at(t) = 0;
+            }
+            for (int x = r.x0; x <= (dir ? r.x1 : best_tgt_cut); x++)
+                for (int y = r.y0; y <= (dir ? best_tgt_cut : r.y1); y++) {
+                    for (size_t t = 0; t < buckets.size(); t++) {
+                        left_bels_v.at(t) += bels_at(x, y, t);
+                    }
+                }
+            for (int x = dir ? r.x0 : (best_tgt_cut + 1); x <= r.x1; x++)
+                for (int y = dir ? (best_tgt_cut + 1) : r.y0; y <= r.y1; y++) {
+                    for (size_t t = 0; t < buckets.size(); t++) {
+                        right_bels_v.at(t) += bels_at(x, y, t);
+                    }
+                }
+            if (std::accumulate(left_bels_v.begin(), left_bels_v.end(), 0) == 0 ||
+                std::accumulate(right_bels_v.begin(), right_bels_v.end(), 0) == 0)
+                return {};
+
+            // Perturb the source cut to eliminate overutilisation
+            auto is_part_overutil = [&](bool r) {
+                double delta = 0;
+                for (size_t t = 0; t < left_cells_v.size(); t++) {
+                    delta += double(left_cells_v.at(t)) / double(std::max(left_bels_v.at(t), 1)) -
+                             double(right_cells_v.at(t)) / double(std::max(right_bels_v.at(t), 1));
+                }
+                return r ? delta < 0 : delta > 0;
+            };
+            while (pivot > 0 && is_part_overutil(false)) {
+                auto &move_cell = cut_cells.at(pivot);
+                int size = p->chain_size.count(move_cell->name) ? p->chain_size.at(move_cell->name) : 1;
+                left_cells_v.at(cell_index(*cut_cells.at(pivot))) -= size;
+                right_cells_v.at(cell_index(*cut_cells.at(pivot))) += size;
+                pivot--;
+            }
+            while (pivot < int(cut_cells.size()) - 1 && is_part_overutil(true)) {
+                auto &move_cell = cut_cells.at(pivot + 1);
+                int size = p->chain_size.count(move_cell->name) ? p->chain_size.at(move_cell->name) : 1;
+                left_cells_v.at(cell_index(*cut_cells.at(pivot))) += size;
+                right_cells_v.at(cell_index(*cut_cells.at(pivot))) -= size;
+                pivot++;
+            }
+
+            // Split regions into bins, and then spread cells by linear interpolation within those bins
+            auto spread_binlerp = [&](int cells_start, int cells_end, double area_l, double area_r) {
+                int N = cells_end - cells_start;
+                if (N <= 2) {
+                    for (int i = cells_start; i < cells_end; i++) {
+                        auto &pos = dir ? p->cell_locs.at(cut_cells.at(i)->name).rawy
+                                        : p->cell_locs.at(cut_cells.at(i)->name).rawx;
+                        pos = area_l + i * ((area_r - area_l) / N);
+                    }
+                    return;
+                }
+                // Split region into up to 10 (K) bins
+                int K = std::min<int>(N, 10);
+                std::vector<std::pair<int, double>> bin_bounds; // [(cell start, area start)]
+                bin_bounds.emplace_back(cells_start, area_l);
+                for (int i = 1; i < K; i++)
+                    bin_bounds.emplace_back(cells_start + (N * i) / K, area_l + ((area_r - area_l + 0.99) * i) / K);
+                bin_bounds.emplace_back(cells_end, area_r + 0.99);
+                for (int i = 0; i < K; i++) {
+                    auto &bl = bin_bounds.at(i), br = bin_bounds.at(i + 1);
+                    double orig_left = dir ? p->cell_locs.at(cut_cells.at(bl.first)->name).rawy
+                                           : p->cell_locs.at(cut_cells.at(bl.first)->name).rawx;
+                    double orig_right = dir ? p->cell_locs.at(cut_cells.at(br.first - 1)->name).rawy
+                                            : p->cell_locs.at(cut_cells.at(br.first - 1)->name).rawx;
+                    double m = (br.second - bl.second) / std::max(0.00001, orig_right - orig_left);
+                    for (int j = bl.first; j < br.first; j++) {
+                        Region *cr = cut_cells.at(j)->region;
+                        if (cr != nullptr) {
+                            // Limit spreading bounds to constraint region; if applicable
+                            double brsc = p->limit_to_reg(cr, br.second, dir);
+                            double blsc = p->limit_to_reg(cr, bl.second, dir);
+                            double mr = (brsc - blsc) / std::max(0.00001, orig_right - orig_left);
+                            auto &pos = dir ? p->cell_locs.at(cut_cells.at(j)->name).rawy
+                                            : p->cell_locs.at(cut_cells.at(j)->name).rawx;
+                            NPNR_ASSERT(pos >= orig_left && pos <= orig_right);
+                            pos = blsc + mr * (pos - orig_left);
+                        } else {
+                            auto &pos = dir ? p->cell_locs.at(cut_cells.at(j)->name).rawy
+                                            : p->cell_locs.at(cut_cells.at(j)->name).rawx;
+                            NPNR_ASSERT(pos >= orig_left && pos <= orig_right);
+                            pos = bl.second + m * (pos - orig_left);
+                        }
+                    }
+                }
+            };
+            spread_binlerp(0, pivot + 1, trimmed_l, best_tgt_cut);
+            spread_binlerp(pivot + 1, int(cut_cells.size()), best_tgt_cut + 1, trimmed_r);
+            // Update various data structures
+            for (int x = r.x0; x <= r.x1; x++)
+                for (int y = r.y0; y <= r.y1; y++) {
+                    cells_at_location.at(x).at(y).clear();
+                }
+            for (auto cell : cut_cells) {
+                auto &cl = p->cell_locs.at(cell->name);
+                cl.x = std::min(r.x1, std::max(r.x0, int(cl.rawx)));
+                cl.y = std::min(r.y1, std::max(r.y0, int(cl.rawy)));
+                cells_at_location.at(cl.x).at(cl.y).push_back(cell);
+            }
+            SpreaderRegion rl, rr;
+            rl.id = int(regions.size());
+            rl.x0 = r.x0;
+            rl.y0 = r.y0;
+            rl.x1 = dir ? r.x1 : best_tgt_cut;
+            rl.y1 = dir ? best_tgt_cut : r.y1;
+            rl.cells = left_cells_v;
+            rl.bels = left_bels_v;
+            rr.id = int(regions.size()) + 1;
+            rr.x0 = dir ? r.x0 : (best_tgt_cut + 1);
+            rr.y0 = dir ? (best_tgt_cut + 1) : r.y0;
+            rr.x1 = r.x1;
+            rr.y1 = r.y1;
+            rr.cells = right_cells_v;
+            rr.bels = right_bels_v;
+            regions.push_back(rl);
+            regions.push_back(rr);
+            for (int x = rl.x0; x <= rl.x1; x++)
+                for (int y = rl.y0; y <= rl.y1; y++)
+                    groups.at(x).at(y) = rl.id;
+            for (int x = rr.x0; x <= rr.x1; x++)
+                for (int y = rr.y0; y <= rr.y1; y++)
+                    groups.at(x).at(y) = rr.id;
+            return std::make_pair(rl.id, rr.id);
+        };
+    };
+    typedef decltype(CellInfo::udata) cell_udata_t;
+    cell_udata_t dont_solve = std::numeric_limits<cell_udata_t>::max();
+
+int LiquidPlacer::CutSpreader::seq = 0;
+
+    
+};
+bool placer_liquid(Context *ctx, LiquidPlacerCfg cfg) { return LiquidPlacer(ctx, cfg).place(); }
+
+LiquidPlacerCfg::LiquidPlacerCfg(Context *ctx)
+{
+    innerItrStart = ctx->setting<int>("placerLiquid/innerIterationStart");
+    innerItrEnd = ctx->setting<int>("placerLiquid/innerIterationEnd");
+    betaOne = ctx->setting<float>("placerLiquid/betaOne");
+    betaTwo = ctx->setting<float>("placerLiquid/betaTwo");
+    eps = ctx->setting<double>("placerLiquid/eps");
+    maxConnLength = ctx->setting<int>("placerLiquid/maxConnLength");
+    maxConnLengthRatio = ctx->setting<float>("placerLiquid/maxConnLengthRatio");
+    nOuterSparse = ctx->setting<int>("placerLiquid/nOuterSparse"); 
+    nOuterDense = ctx->setting<int>("placerLiquid/nOuterDense");
+    learningRateStart = ctx->setting<double>("placerLiquid/learningRateStart");
+    learningRateStop = ctx->setting<double>("placerLiquid/learningRateStop");
+    anchorWeightStop = ctx->setting<double>("placerLiquid/anchorWeightStop");
+    anchorWeightExponent = ctx->setting<double>("placerLiquid/anchorWeightExponent");
+ 
+    alpha = ctx->setting<float>("placerLiquid/alpha");
+    beta = ctx->setting<float>("placerLiquid/beta");
+    criticalityExponent = ctx->setting<int>("placerLiquid/criticalityExponent");
+    timingWeight = ctx->setting<int>("placerLiquid/timingWeight");
+    parallelRefine = ctx->setting<bool>("placerLiquid/parallelRefine", false);
+    netShareWeight = ctx->setting<float>("placerLiquid/netShareWeight", 0);
+    disableCtrlSet = ctx->setting<bool>("placerLiquid/noCtrlSet", false);
+
+    timing_driven = ctx->setting<bool>("timing_driven");
+    solverTolerance = 1e-5;
+    placeAllAtOnce = false;
+    chainRipup = false;
+
+    int timeout_divisor = ctx->setting<int>("placerHeap/cellPlacementTimeout", 8);
+    if (timeout_divisor > 0) {
+        // Set a conservative default. This is a rather large number and could probably
+        // be shaved down, but for now it will keep the process from running indefinite.
+        cell_placement_timeout = std::max(10000, (int(ctx->cells.size()) * int(ctx->cells.size()) / timeout_divisor));
+    } else {
+        cell_placement_timeout = 0;
+    }
+
+    hpwl_scale_x = 1;
+    hpwl_scale_y = 1;
+    spread_scale_x = 1;
+    spread_scale_y = 1;
+}
+NEXTPNR_NAMESPACE_END

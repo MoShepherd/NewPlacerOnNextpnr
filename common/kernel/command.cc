@@ -392,6 +392,32 @@ po::options_description CommandHandler::getGeneralOptions()
 
     general.add_options()("placer-heap-no-ctrl-set", "disable control set awareness in placer heap");
 
+    //Add Options for Liquid
+    general.add_options()("placer-liquid-alpha", po::value<float>(), "placer liquid alpha value (float, default: 0.1)");
+    general.add_options()("placer-liquid-beta", po::value<float>(),
+                          "placer liquid maximum placement density (float, default: 0.9)");
+    general.add_options()("placer-liquid-critexp", po::value<int>(),
+                          "placer liquid criticality exponent (int, default: 2)");
+    general.add_options()("placer-liquid-timingweight", po::value<int>(), "placer liquid timing weight (int, default: 10)");
+    general.add_options()("placer-liquid-cell-placement-timeout", po::value<int>(),
+                          "allow placer to attempt up to max(10000, total cells^2 / N) iterations to place a cell (int "
+                          "N, default: 8, 0 for no timeout)");
+    general.add_options()("placer-liquid-no-ctrl-set", "disable control set awareness in placer heap");
+    general.add_options()("placer-liquid-inner-iteration-start",po::value<int>(), "Inner effort-level for start of gradient optimization (int, default 200)");
+    general.add_options()("placer-liquid-inner-iteration-end",po::value<int>(), "Inner effort-level for end of gradient optimization (int, default 50)");
+    general.add_options()("placer-liquid-beta-one",po::value<float>(), "Hyper-Parameter to control exponential decay rates of moving averages (Adam-Algorithm)");
+    general.add_options()("placer-liquid-beta-two",po::value<float>(), "Hyper-Parameter to control exponential decay rates of moving averages (Adam-Algorithm)");
+    general.add_options()("placer-liquid-eps",po::value<double>(), "Stabilisation-Value for square root for coordinate calculation (Adam-Algorithm)");
+    general.add_options()("placer-liquid-max-conn-length",po::value<int>(), "Maximum length of a connection in the netlist");
+    general.add_options()("placer-liquid-max-conn-length-ratio",po::value<float>(), "Ratio for connection length depending on Fpga-Architecture-Width");
+    general.add_options()("placer-liquid-n-outer-sparse",po::value<int>(), "NOuter for sparse cirquit-designs");
+    general.add_options()("placer-liquid-n-outer-dense",po::value<int>(), "NOuter for dense cirquit-designs");
+    general.add_options()("placer-liquid-learning-rate-start",po::value<double>(), "Speed of move-vector for beginning of gradient optimization")
+    general.add_options()("placer-liquid-learning-rate-stop",po::value<double>(), "Speed of move-vector for end of gradient optimization")
+    general.add_options()("placer-liquid-anchor-weight-stop",po::value<double>(), "Value of target anchorweight")
+    general.add_options()("placer-liquid-anchor-weight-exponent",po::value<double>(), "Degree of anchorweight calculation")
+
+
     general.add_options()("static-dump-density", "write density csv files during placer-static flow");
 
 #if !defined(NPNR_DISABLE_THREADS)
@@ -532,6 +558,56 @@ void CommandHandler::setupContext(Context *ctx)
     if (vm.count("parallel-refine"))
         ctx->settings[ctx->id("placerHeap/parallelRefine")] = true;
 
+    //Extract config for Liquid
+    if (vm.count("placer-liquid-alpha"))
+        ctx->settings[ctx->id("placerLiquid/alpha")] = std::to_string(vm["placer-liquid-alpha"].as<float>());
+
+    if (vm.count("placer-liquid-beta"))
+        ctx->settings[ctx->id("placerLiquid/beta")] = std::to_string(vm["placer-liquid-beta"].as<float>());
+
+    if (vm.count("placer-liquid-critexp"))
+        ctx->settings[ctx->id("placerLiquid/criticalityExponent")] = std::to_string(vm["placer-liquid-critexp"].as<int>());
+
+    if (vm.count("placer-liquid-timingweight"))
+        ctx->settings[ctx->id("placerLiquid/timingWeight")] = std::to_string(vm["placer-liquid-timingweight"].as<int>());
+
+    if (vm.count("placer-liquid-cell-placement-timeout"))
+        ctx->settings[ctx->id("placerLiquid/cellPlacementTimeout")] =
+                std::to_string(std::max(0, vm["placer-liquid-cell-placement-timeout"].as<int>()));
+
+    if (vm.count("placer-liquid-no-ctrl-set"))
+        ctx->settings[ctx->id("placerLiquid/noCtrlSet")] = true;
+
+    //if (vm.count("parallel-refine"))
+    //    ctx->settings[ctx->id("placerLiquid/parallelRefine")] = true;
+
+    if (vm.count("placer-liquid-inner-iteration-start"))
+        ctx->settings[ctx->id("placerLiquid/innerIterationStart")] = std::to_string(vm["placer-liquid-inner-iteration-start"].as<int>());
+    if (vm.count("placer-liquid-inner-iteration-end"))
+        ctx->settings[ctx->id("placerLiquid/innerIterationEnd")] = std::to_string(vm["placer-liquid-inner-iteration-end"].as<int>());
+    if (vm.count("placer-liquid-beta-one"))
+        ctx->settings[ctx->id("placerLiquid/betaOne")] = std::to_string(vm["placer-liquid-beta-one"].as<float>());
+    if (vm.count("placer-liquid-beta-two"))
+        ctx->settings[ctx->id("placerLiquid/betaTwo")] = std::to_string(vm["placer-liquid-beta-two"].as<float>());
+    if (vm.count("placer-liquid-eps"))
+        ctx->settings[ctx->id("placerLiquid/eps")] = std::to_string(vm["placer-liquid-eps"].as<double>());
+    if (vm.count("placer-liquid-max-conn-length"))
+        ctx->settings[ctx->id("placerLiquid/maxConnLength")] = std::to_string(vm["placer-liquid-max-connlength"].as<int>());
+    if (vm.count("placer-liquid-max-conn-length-ratio"))
+        ctx->settings[ctx->id("placerLiquid/maxConnLengthRatio")] = std::to_string(vm["placer-liquid-max-conn-length-ratio"].as<float>());
+    if (vm.count("placer-liquid-n-outer-sparse"))
+        ctx->settings[ctx->id("placerLiquid/nOuterSparse")] = std::to_string(vm["placer-liquid-n-outer-sparse"].as<int>());
+    if(vm.count("placer-liquid-n-outer-dense"))
+        ctx->settings[ctx->id("placerLiquid/nOuterDense")] = std::to_string(vm["placer-liquid-n-outer-dense"].as<int>());
+    if(vm.count("placer-liquid-learning-rate-start"))
+        ctx->settings[ctx->id("placerLiquid/learningRateStart")] = std::to_string(vm["placer-liquid-learning-rate-start"].as<double>());
+    if(vm.count("placer-liquid-learning-rate-stop"))
+        ctx->settings[ctx->id("placerLiquid/learningRateStop")] = std::to_string(vm["placer-liquid-learning-rate-stop"].as<double>());
+    if(vm.count("placer-liquid-anchor-weight-stop"))
+        ctx->settings[ctx->id("placerLiquid/anchorWeightStop")] = std::to_string(vm["placer-liquid-anchor-weight-stop"].as<double>());
+    if(vm.count("placer-liquid-anchor-weight-exponent"))
+        ctx->settings[ctx->id("placerLiquid/anchorWeightExponent")] = std::to_string(vm["placer-liquid-anchor-weight-exponent"].as<double>());
+
     if (vm.count("router2-heatmap"))
         ctx->settings[ctx->id("router2/heatmap")] = vm["router2-heatmap"].as<std::string>();
     if (vm.count("tmg-ripup") || vm.count("router2-tmg-ripup"))
@@ -571,6 +647,44 @@ void CommandHandler::setupContext(Context *ctx)
     if (vm.count("detailed-timing-report")) {
         ctx->detailed_timing_report = true;
     }
+
+    //Liquid Defaults
+    //Copied from Heap (Liquid uses Heap-Legalizing)
+    if (ctx->settings.find(ctx->id("placerLiquid/alpha")) == ctx->settings.end())
+        ctx->settings[ctx->id("placerLiquid/alpha")] = std::to_string(0.1);
+    if (ctx->settings.find(ctx->id("placerLiquid/beta")) == ctx->settings.end())
+        ctx->settings[ctx->id("placerLiquid/beta")] = std::to_string(0.9);
+    if (ctx->settings.find(ctx->id("placerLiquid/criticalityExponent")) == ctx->settings.end())
+        ctx->settings[ctx->id("placerLiquid/criticalityExponent")] = std::to_string(2);
+    if (ctx->settings.find(ctx->id("placerLiquid/timingWeight")) == ctx->settings.end())
+        ctx->settings[ctx->id("placerLiquid/timingWeight")] = std::to_string(10);
+    //New 
+    if (ctx->settings.find(ctx->id("placerLiquid/innerIterationStart")) == ctx->settings.end())
+        ctx->settings[ctx->id("placerLiquid/innerIterationStart")] = std::to_string(200);
+    if (ctx->settings.find(ctx->id("placerLiquid/innerIterationStop")) == ctx->settings.end())
+        ctx->settings[ctx->id("placerLiquid/innerIterationStop")] = std::to_string(50);
+    if (ctx->settings.find(ctx->id("placerLiquid/betaOne")) == ctx->settings.end())
+        ctx->settings[ctx->id("placerLiquid/betaOne")] = std::to_string(0.9);
+    if (ctx->settings.find(ctx->id("placerLiquid/betaTwo")) == ctx->settings.end())
+        ctx->settings[ctx->id("placerLiquid/betaTwo")] = std::to_string(0.999);
+    if (ctx->settings.find(ctx->id("placerLiquid/eps")) == ctx->settings.end())
+        ctx->settings[ctx->id("placerLiquid/eps")] = std::to_string(10e-10);
+    if (ctx->settings.find(ctx->id("placerLiquid/maxConnLength")) == ctx->settings.end())
+        ctx->settings[ctx->id("placerLiquid/maxConnLength")] = std::to_string(30);
+    if (ctx->settings.find(ctx->id("placerLiquid/maxConnLengthRatio")) == ctx->settings.end())
+        ctx->settings[ctx->id("placerLiquid/maxConnLengthRatio")] = std::to_string(0.25);
+    if(ctx->settings.find(ctx->id("placerLiquid/nOuterSparse")) == ctx->settings.end())
+        ctx-settings[ctx->id("placerLiquid/nOuterSparse")] = std::to_string(15);
+    if(ctx->settings.find(ctx->id("placerLiquid/nOuterDense")) == ctx->settings.end())
+        ctx-settings[ctx->id("placerLiquid/nOuterDense")] = std::to_string(40);
+    if(ctx->settings.find(ctx->id("placerLiquid/learningRateStart")) == ctx->settings.end())
+        ctx-settings[ctx->id("placerLiquid/learningRateStart")] = std::to_string(1.0);
+    if(ctx->settings.find(ctx->id("placerLiquid/learningRateStop")) == ctx->settings.end())
+        ctx-settings[ctx->id("placerLiquid/learningRateStop")] = std::to_string(0.2);
+    if(ctx->settings.find(ctx->id("placerLiquid/anchorWeightStop")) == ctx->settings.end())
+        ctx-settings[ctx->id("placerLiquid/anchorWeightStop")] = std::to_string(0.85);
+    if(ctx->settings.find(ctx->id("placerLiquid/anchorWeightExponent")) == ctx->settings.end())
+        ctx-settings[ctx->id("placerLiquid/anchorWeightExponent")] = std::to_string(2.0);
 }
 
 int CommandHandler::executeMain(std::unique_ptr<Context> ctx)

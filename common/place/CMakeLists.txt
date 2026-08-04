@@ -15,6 +15,8 @@ target_sources(nextpnr_place PUBLIC
     placer1.h
     placer_heap.cc
     placer_heap.h
+    placer_liquid.cc
+    placer_liquid.h
     placer_static.cc
     placer_static.h
     static_util.h
