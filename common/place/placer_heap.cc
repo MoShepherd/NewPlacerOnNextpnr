@@ -259,17 +259,17 @@ class HeAPPlacer
                 auto solve_startt = std::chrono::high_resolution_clock::now();
 
                 // Build the connectivity matrix and run the solver; multithreaded between x and y axes if applicable
-#ifndef NPNR_DISABLE_THREADS
-                if (solve_cells.size() >= 500) {
+//#ifndef NPNR_DISABLE_THREADS
+/*                if (solve_cells.size() >= 500) {
                     boost::thread xaxis([&]() { build_solve_direction(false, (iter == 0) ? -1 : iter); });
                     build_solve_direction(true, (iter == 0) ? -1 : iter);
                     xaxis.join();
                 } else
 #endif
-                {
+                {*/
                     build_solve_direction(false, (iter == 0) ? -1 : iter);
                     build_solve_direction(true, (iter == 0) ? -1 : iter);
-                }
+                //}
                 auto solve_endt = std::chrono::high_resolution_clock::now();
                 solve_time += std::chrono::duration<double>(solve_endt - solve_startt).count();
                 update_all_chains();
@@ -2171,7 +2171,7 @@ PlacerHeapCfg::PlacerHeapCfg(Context *ctx)
 
     timing_driven = ctx->setting<bool>("timing_driven");
     solverTolerance = 1e-5;
-    placeAllAtOnce = false;
+    placeAllAtOnce = true;
     chainRipup = false;
 
     int timeout_divisor = ctx->setting<int>("placerHeap/cellPlacementTimeout", 8);

@@ -512,7 +512,7 @@ template <typename FrontendType> struct GenericFrontend
                 // Index of port net in flatindex
                 int net_ref = -1;
                 if (impl.is_vector_bit_constant(bits, i)) {
-                    // Create a constant driver if one is needed
+                 // Create a constant driver if one is needed
                     std::string port_bit_name = get_bit_name(name, i, width);
                     NetInfo *cnet = create_constant_net(m, name + "." + port_bit_name + "$const",
                                                         impl.get_vector_bit_constval(bits, i));

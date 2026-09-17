@@ -1,2 +1,0 @@
-Pin_in  "clk"     Loc = "IO_SB_A8";
-Pin_out "uart_tx" Loc = "IO_SB_A3";

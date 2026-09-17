@@ -281,7 +281,7 @@ bool Arch::place()
     } else if (placer == "sa") {
         retVal = placer1(getCtx(), Placer1Cfg(getCtx()));
     } else if(placer == "liquid"){
-        LiquidPlacerCfg cfg(getCtx());
+        PlacerLiquidCfg cfg(getCtx());
         retVal = placer_liquid(getCtx(), cfg);
     } else {
         log_error("Himbächel architecture does not support placer '%s'\n", placer.c_str());

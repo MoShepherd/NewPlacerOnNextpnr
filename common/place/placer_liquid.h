@@ -10,9 +10,9 @@ Globalb
 
 NEXTPNR_NAMESPACE_BEGIN
 
-struct LiquidPlacerCfg
+struct PlacerLiquidCfg
 {
-    LiquidPlacerCfg(Context *ctx);
+    PlacerLiquidCfg(Context *ctx);
 
     int innerItrStart, innerItrEnd;
     float betaOne, betaTwo;
@@ -48,6 +48,10 @@ struct LiquidPlacerCfg
 
     bool disableCtrlSet;
 
+    //Datastructure should contain all logic-block-types for calculation of utilisation of logic blocks. 
+    //This is an important decision-value in placer liquid
+    std::vector<BelBucketId> logicBlockTypes; 
+
     /*
     Control set API
     HeAP legalisation can be sped up by directly searching for nearby tiles to place an FF with a compatible control
@@ -76,6 +80,6 @@ struct LiquidPlacerCfg
     };
 };
 
-extern bool placer_liquid(Context *ctx, LiquidPlacerCfg cfg);
+extern bool placer_liquid(Context *ctx, PlacerLiquidCfg cfg);
 NEXTPNR_NAMESPACE_END
 #endif

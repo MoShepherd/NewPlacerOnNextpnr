@@ -412,10 +412,10 @@ po::options_description CommandHandler::getGeneralOptions()
     general.add_options()("placer-liquid-max-conn-length-ratio",po::value<float>(), "Ratio for connection length depending on Fpga-Architecture-Width");
     general.add_options()("placer-liquid-n-outer-sparse",po::value<int>(), "NOuter for sparse cirquit-designs");
     general.add_options()("placer-liquid-n-outer-dense",po::value<int>(), "NOuter for dense cirquit-designs");
-    general.add_options()("placer-liquid-learning-rate-start",po::value<double>(), "Speed of move-vector for beginning of gradient optimization")
-    general.add_options()("placer-liquid-learning-rate-stop",po::value<double>(), "Speed of move-vector for end of gradient optimization")
-    general.add_options()("placer-liquid-anchor-weight-stop",po::value<double>(), "Value of target anchorweight")
-    general.add_options()("placer-liquid-anchor-weight-exponent",po::value<double>(), "Degree of anchorweight calculation")
+    general.add_options()("placer-liquid-learning-rate-start",po::value<double>(), "Speed of move-vector for beginning of gradient optimization");
+    general.add_options()("placer-liquid-learning-rate-stop",po::value<double>(), "Speed of move-vector for end of gradient optimization");
+    general.add_options()("placer-liquid-anchor-weight-stop",po::value<double>(), "Value of target anchorweight");
+    general.add_options()("placer-liquid-anchor-weight-exponent",po::value<double>(), "Degree of anchorweight calculation");
 
 
     general.add_options()("static-dump-density", "write density csv files during placer-static flow");
@@ -661,8 +661,8 @@ void CommandHandler::setupContext(Context *ctx)
     //New 
     if (ctx->settings.find(ctx->id("placerLiquid/innerIterationStart")) == ctx->settings.end())
         ctx->settings[ctx->id("placerLiquid/innerIterationStart")] = std::to_string(200);
-    if (ctx->settings.find(ctx->id("placerLiquid/innerIterationStop")) == ctx->settings.end())
-        ctx->settings[ctx->id("placerLiquid/innerIterationStop")] = std::to_string(50);
+    if (ctx->settings.find(ctx->id("placerLiquid/innerIterationEnd")) == ctx->settings.end())
+        ctx->settings[ctx->id("placerLiquid/innerIterationEnd")] = std::to_string(50);
     if (ctx->settings.find(ctx->id("placerLiquid/betaOne")) == ctx->settings.end())
         ctx->settings[ctx->id("placerLiquid/betaOne")] = std::to_string(0.9);
     if (ctx->settings.find(ctx->id("placerLiquid/betaTwo")) == ctx->settings.end())
@@ -674,17 +674,17 @@ void CommandHandler::setupContext(Context *ctx)
     if (ctx->settings.find(ctx->id("placerLiquid/maxConnLengthRatio")) == ctx->settings.end())
         ctx->settings[ctx->id("placerLiquid/maxConnLengthRatio")] = std::to_string(0.25);
     if(ctx->settings.find(ctx->id("placerLiquid/nOuterSparse")) == ctx->settings.end())
-        ctx-settings[ctx->id("placerLiquid/nOuterSparse")] = std::to_string(15);
+        ctx->settings[ctx->id("placerLiquid/nOuterSparse")] = std::to_string(15);
     if(ctx->settings.find(ctx->id("placerLiquid/nOuterDense")) == ctx->settings.end())
-        ctx-settings[ctx->id("placerLiquid/nOuterDense")] = std::to_string(40);
+        ctx->settings[ctx->id("placerLiquid/nOuterDense")] = std::to_string(40);
     if(ctx->settings.find(ctx->id("placerLiquid/learningRateStart")) == ctx->settings.end())
-        ctx-settings[ctx->id("placerLiquid/learningRateStart")] = std::to_string(1.0);
+        ctx->settings[ctx->id("placerLiquid/learningRateStart")] = std::to_string(1.0);
     if(ctx->settings.find(ctx->id("placerLiquid/learningRateStop")) == ctx->settings.end())
-        ctx-settings[ctx->id("placerLiquid/learningRateStop")] = std::to_string(0.2);
+        ctx->settings[ctx->id("placerLiquid/learningRateStop")] = std::to_string(0.2);
     if(ctx->settings.find(ctx->id("placerLiquid/anchorWeightStop")) == ctx->settings.end())
-        ctx-settings[ctx->id("placerLiquid/anchorWeightStop")] = std::to_string(0.85);
+        ctx->settings[ctx->id("placerLiquid/anchorWeightStop")] = std::to_string(0.85);
     if(ctx->settings.find(ctx->id("placerLiquid/anchorWeightExponent")) == ctx->settings.end())
-        ctx-settings[ctx->id("placerLiquid/anchorWeightExponent")] = std::to_string(2.0);
+        ctx->settings[ctx->id("placerLiquid/anchorWeightExponent")] = std::to_string(2.0);
 }
 
 int CommandHandler::executeMain(std::unique_ptr<Context> ctx)

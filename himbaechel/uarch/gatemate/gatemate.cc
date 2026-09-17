@@ -23,6 +23,7 @@
 #include "log.h"
 #include "nextpnr_assertions.h"
 #include "placer_heap.h"
+#include "placer_liquid.h"
 
 #define GEN_INIT_CONSTIDS
 #define HIMBAECHEL_CONSTIDS "uarch/gatemate/constids.inc"
@@ -999,6 +1000,14 @@ bool GateMateImpl::isGroupResource(GroupId group) const { return ctx->getGroupTy
 
 void GateMateImpl::configurePlacerHeap(PlacerHeapCfg &cfg)
 {
+    cfg.chainRipup = true;
+    cfg.placeAllAtOnce = true;
+}
+
+void GateMateImpl::configurePlacerLiquid(PlacerLiquidCfg &cfg)
+{
+    cfg.logicBlockTypes.insert(cfg.logicBlockTypes.end(),id_CPE_FF);
+    cfg.logicBlockTypes.insert(cfg.logicBlockTypes.end(),id_CPE_LT);
     cfg.chainRipup = true;
     cfg.placeAllAtOnce = true;
 }

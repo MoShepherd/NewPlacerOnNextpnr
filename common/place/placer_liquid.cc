@@ -1,18 +1,17 @@
 #include "placer_liquid.h"
 #include <deque>
+#include <numeric>
 #include <queue>
 #include <cmath>
 #include "log.h"
 #include "nextpnr.h"
 #include "fast_bels.h"
+#include "placer1.h"
 #include "place_common.h"
 #include "array2d.h"
 
-#define HIMBAECHEL_CONSTIDS "uarch/gatemate/constids.inc"
-#include "himbaechel_constids.h"
-
 NEXTPNR_NAMESPACE_BEGIN
-
+//TODO: write configs for architectures: gowin line 57, ng_ultra line 451, xilinx line 350
 namespace{
     struct ControlSetState
     {
@@ -40,66 +39,249 @@ namespace{
 
 // This work uses many functions of placer_heap. In general it depends on the paper 'Liquid: High Quality Scalable Placement for Large Heterogeneous FPGAs'
 
-class LiquidPlacer
+class PlacerLiquid
 {
   public:
-    LiquidPlacer(Context *ctx, LiquidPlacerCfg cfg): ctx(ctx), cfg(cfg),  fast_bels(ctx, /*check_bel_available=*/true, -1){
+    PlacerLiquid(Context *ctx, PlacerLiquidCfg cfg): ctx(ctx), cfg(cfg),  fast_bels(ctx, /*check_bel_available=*/true, -1){
         if(ratio_used_logic_blocks() > 0.8){
-            numIteration = cfg.nOuterDense + 1;
+            outerIterations = cfg.nOuterDense + 1;
         }else{
-            numIteration = cfg.nOuterSparse + 1;
+            outerIterations = cfg.nOuterSparse + 1;
         }
         learningRate = cfg.learningRateStart;
-        learningRateMultiplier = std::pow(cfg.learningRateStop / cfg.learningRateStart, 1.0 / (numIteration - 1.0));
+        learningRateMultiplier = std::pow(cfg.learningRateStop / cfg.learningRateStart, 1.0 / (outerIterations - 1.0));
         if(ratio_used_logic_blocks() < 0.4){
             maxConnectionLength = ctx->getGridDimX() * cfg.maxConnLengthRatio;
         }else{
             maxConnectionLength = cfg.maxConnLength;
         }
-        innerItration = cfg.innerItrStart;
+        innerIteration = cfg.innerItrStart;
+
+        for (auto &cell : ctx->cells)
+            if (!cell.second->isPseudo() && cell.second->cluster != ClusterId())
+                cluster2cells[cell.second->cluster].push_back(cell.second.get());
     }
     
     //Main Placing-Method
     bool place(){
-
-      //Start timing
+        
+        //Catch starting time
+        auto startt = std::chrono::high_resolution_clock::now();
       
-      //Lock Context 
-      std::unique_lock<Context> lock{*ctx};
+        //Lock Context 
+        std::unique_lock<Context> lock{*ctx};
 
-      //Place Constraint: nextpnr/docs/constraints.md/##Absolute Placement Constraint
-      place_constraints();
-      //Maybe Heap-Specific. Structure fast_bels is used in spreading and legalisation
-      build_fast_bels();
-      //Alloc control_sets() is maybe Heap-specific. Needed in Heap for Legalisation.
+        //Place Constraint: nextpnr/docs/constraints.md/##Absolute Placement Constraint
+        place_constraints();
+        //Maybe Heap-Specific. Structure fast_bels is used in spreading and legalisation
+        build_fast_bels();
+        alloc_control_sets();
 
-      //Seed placement
-      seed_placement();
-      
-      //Update all chains. Put placed loc of chain-parent to chain-childs
-      update_all_chains();
+        //Seed placement
+        seed_placement();
+        
+        //Update all chains. Put placed loc of chain-parent to chain-childs
+        update_all_chains();
 
-      //Compute HPWL
-      wirelen_t hpwl = total_hpwl();
+        //Compute HPWL
+        wirelen_t hpwl = total_hpwl();
+        log_info("Creating initial analytic placement for %d cells, random placement wirelen = %d.\n",
+        int(place_cells.size()), int(hpwl));
+        wirelen_t solved_hpwl = 0, spread_hpwl = 0, legal_hpwl = 0, best_hpwl = std::numeric_limits<wirelen_t>::max();
+        iteration = 0;
 
-      for (int NOuter = 0; NOuter < 4; NOuter++) {
-        setup_solve_cells();
-      }
+        std::vector<std::tuple<CellInfo *, BelId, PlaceStrength>> solution;
 
-      
+        std::vector<pool<BelBucketId>> heap_runs;
+        pool<BelBucketId> all_buckets;
+        dict<BelBucketId, int> bucket_count;
 
-      return true;
+        for (auto cell : place_cells) {
+            BelBucketId bucket = ctx->getBelBucketForCellType(cell->type);
+            if (!all_buckets.count(bucket)) {
+                heap_runs.push_back(pool<BelBucketId>{bucket});
+                all_buckets.insert(bucket);
+            }
+            bucket_count[bucket]++;
+        }
+        // If more than 98% of cells are one cell type, always solve all at once
+        // Otherwise, follow full HeAP strategy of rotate&all
+        for (auto &c : bucket_count) {
+            if (c.second >= 0.98 * int(place_cells.size())) {
+                heap_runs.clear();
+                break;
+            }
+        }
+
+        if (cfg.placeAllAtOnce) {
+            // Never want to deal with LUTs, FFs, MUXFxs separately,
+            // for now disable all single-cell-type runs and only have heterogeneous
+            // runs
+            heap_runs.clear();
+        }
+
+        heap_runs.push_back(all_buckets);
+        // The main HeAP placer loop
+        if (cfg.cell_placement_timeout > 0)
+            log_info("Running main analytical placer, max placement attempts per cell = %d.\n",
+                     cfg.cell_placement_timeout);
+        else
+            log_info("Running main analytical placer.\n");
+
+        while(!isLastIteration){
+
+            initializeNOuter(iteration);
+            for (auto &run : heap_runs) {
+                auto run_startt = std::chrono::high_resolution_clock::now();
+
+                setup_solve_cells(&run);
+                if (solve_cells.empty())
+                    continue;
+                // Heuristic: don't bother with threading below a certain size
+                auto solve_startt = std::chrono::high_resolution_clock::now();
+
+                for(int i = 0; i < innerIteration; i++) solveInnerIteration();
+
+                auto solve_endt = std::chrono::high_resolution_clock::now();
+                solve_time += std::chrono::duration<double>(solve_endt - solve_startt).count();
+                update_all_chains();
+                solved_hpwl = total_hpwl();
+                update_all_chains();
+
+                // Run the spreader
+                for (const auto &group : cfg.cellGroups)
+                    CutSpreader(this, group).run();
+
+                for (auto type : run)
+                    if (std::all_of(cfg.cellGroups.begin(), cfg.cellGroups.end(),
+                                    [type](const pool<BelBucketId> &grp) { return !grp.count(type); }))
+                        CutSpreader(this, {type}).run();
+
+                // Run strict legalisation to find a valid bel for all cells
+                update_all_chains();
+                spread_hpwl = total_hpwl();
+                legalise_placement_strict();
+                update_all_chains();
+
+                legal_hpwl = total_hpwl();
+                auto run_stopt = std::chrono::high_resolution_clock::now();
+
+                IdString bucket_name = ctx->getBelBucketName(*run.begin());
+                log_info("    at iteration #%d, type %s: wirelen solved = %d, spread = %d, legal = %d; time = %.02fs\n",
+                         iteration + 1, (run.size() > 1 ? "ALL" : bucket_name.c_str(ctx)), int(solved_hpwl),
+                         int(spread_hpwl), int(legal_hpwl),
+                         std::chrono::duration<double>(run_stopt - run_startt).count());
+            
+            }
+
+            // Save solution
+            if (legal_hpwl < best_hpwl) {
+                best_hpwl = legal_hpwl;
+                
+                solution.clear();
+                for (auto &cell : ctx->cells) {
+                    if (cell.second->isPseudo())
+                        continue;
+                    solution.emplace_back(cell.second.get(), cell.second->bel, cell.second->belStrength);
+                }
+            }
+            for (auto &cl : cell_locs) {
+                cl.second.legal_x = cl.second.x;
+                cl.second.legal_y = cl.second.y;
+            }
+            ctx->yield();
+            isLastIteration = stopCondition(iteration);
+            ++iteration;
+        }
+
+                // Remove any previous binding
+        for (auto &sc : solution) {
+            CellInfo *cell = std::get<0>(sc);
+            if (cell->bel != BelId())
+                ctx->unbindBel(cell->bel);
+        }
+        // Apply saved solution
+        for (auto &sc : solution) {
+            CellInfo *cell;
+            BelId bel;
+            PlaceStrength strength;
+            std::tie(cell, bel, strength) = sc;
+            // Just skip unbound cells here, these errors are handled just after
+            if (bel == BelId())
+                continue;
+            ctx->bindBel(bel, cell, strength);
+        }
+
+        // Find and display all errors to help in finding the root cause of issues
+        unsigned num_errors = 0;
+        for (auto &cell : ctx->cells) {
+            if (cell.second->isPseudo())
+                continue;
+            if (cell.second->bel == BelId()) {
+                log_nonfatal_error("Found unbound cell '%s' of type '%s'\n", cell.first.c_str(ctx),
+                                   cell.second->type.c_str(ctx));
+                num_errors++;
+            } else if (ctx->getBoundBelCell(cell.second->bel) != cell.second.get()) {
+                log_nonfatal_error("Found mismatched binding for '%s' or type '%s'\n", cell.first.c_str(ctx),
+                                   cell.second->type.c_str(ctx));
+                num_errors++;
+            } else if (ctx->debug)
+                log_info("AP soln: %s -> %s\n", cell.first.c_str(ctx), ctx->nameOfBel(cell.second->bel));
+        }
+        if (num_errors > 0) {
+            log_error("Stopping the program after %u errors found\n", num_errors);
+        }
+
+        bool any_bad_placements = false;
+        for (auto bel : ctx->getBels()) {
+            CellInfo *cell = ctx->getBoundBelCell(bel);
+            if (!ctx->isBelLocationValid(bel, /* explain_invalid */ true)) {
+                std::string cell_text = "no cell";
+                if (cell != nullptr)
+                    cell_text = std::string("cell '") + ctx->nameOf(cell) + "'";
+                log_warning("post-placement validity check failed for Bel '%s' "
+                            "(%s)\n",
+                            ctx->nameOfBel(bel), cell_text.c_str());
+                any_bad_placements = true;
+            }
+        }
+
+        if (any_bad_placements) {
+            return false;
+        }
+
+        auto endtt = std::chrono::high_resolution_clock::now();
+        log_info("Liquid Placer Time: %.02fs\n", std::chrono::duration<double>(endtt - startt).count());
+        log_info("  of which solving equations: %.02fs\n", solve_time);
+        log_info("  of which spreading cells: %.02fs\n", cl_time);
+        log_info("  of which strict legalisation: %.02fs\n", sl_time);
+
+        if (ctx->verbose) {
+            for (auto pair : time_per_cell_type) {
+                log_info("     %s %.03fs\n", ctx->nameOf(pair.first), pair.second);
+            }
+        }
+
+        ctx->check();
+        lock.unlock();
+        auto placer1_cfg = Placer1Cfg(ctx);
+            placer1_cfg.hpwl_scale_x = cfg.hpwl_scale_x;
+            placer1_cfg.hpwl_scale_y = cfg.hpwl_scale_y;
+            placer1_cfg.netShareWeight = cfg.netShareWeight;
+            if (!placer1_refine(ctx, placer1_cfg)) {
+                return false;
+            }
+        return true;
     }
 
 
 
   private:
     Context *ctx;
-    LiquidPlacerCfg cfg;
-    //Maybe Heap-Specific
+    PlacerLiquidCfg cfg;
     int max_x = 0, max_y = 0;
     
-    //For spreading and legalising. Maybe Heap-Specific
+    //For spreading and legalising. 
     FastBels fast_bels;
     dict<IdString, BoundingBox> constraint_region_bounds;
     // Tracking control sets
@@ -108,10 +290,13 @@ class LiquidPlacer
     dict<ClusterId, std::vector<CellInfo *>> cluster2cells;
     dict<IdString, int> cell_ctrl_set;
     dict<ClusterId, int> chain_size;
+    dict<IdString, float> time_per_cell_type;
 
     double anchorWeight = 0.0, learningRate, learningRateMultiplier, maxConnectionLength;
-    int numIteration, innerItration;
-    bool legalIsInitialize = false;
+    int outerIterations, innerIteration, iteration;
+    bool legalIsInitialize = false, isLastIteration = false;
+    double solve_time = 0, cl_time = 0, sl_time = 0;
+
 
     //The solving process of Liquid needs for each cell the folling values in the structure.
     //These values are used for calculating the gradient of the cells move-vector in the solving-procedure  
@@ -124,9 +309,6 @@ class LiquidPlacer
         double momentum, speeds; 
     };
     dict<IdString, EquationValues> solve_cells_equations;
-
-    //For the Celltype specific solving is following data-structure needed. It says that a net contains this celltype.
-    dict<IdString, bool> net_has_celltype;
 
     // In some cases, we can't use bindBel because we allow overlap in the earlier stages. So we use this custom
     // structure instead
@@ -147,6 +329,10 @@ class LiquidPlacer
     // cells of a certain type)
     std::vector<CellInfo *> solve_cells;
 
+    // Stop conditon during placement
+    bool stopCondition(int iteration) {
+    	return iteration + 1 >= outerIterations;
+    }
     // Place cells with the BEL attribute set to constrain them
     void place_constraints()
     {
@@ -318,6 +504,73 @@ class LiquidPlacer
         tile.at(fnd->second).unbind();
     }
 
+    int32_t get_cluster_control_set(ClusterId cluster)
+    {
+        int32_t ctrl_set = -1;
+        if (cfg.ff_bel_bucket == BelBucketId() || cfg.disableCtrlSet)
+            return -1;
+        for (auto cell : cluster2cells.at(cluster)) {
+            auto ofs = ctx->getClusterOffset(cell);
+            if (ofs.x != 0 || ofs.y != 0)
+                return -1; // big cluster
+            if (ctx->getBelBucketForCellType(cell->type) != cfg.ff_bel_bucket)
+                continue;
+            auto cell_ctrl_set = cfg.get_cell_control_set(ctx, cell);
+            if (cell_ctrl_set == -1)
+                continue;
+            if (ctrl_set == -1 || ctrl_set == cell_ctrl_set) {
+                ctrl_set = cell_ctrl_set;
+            } else {
+                // mismatch, complex cluster
+                return -1;
+            }
+        }
+        return ctrl_set;
+    }
+
+    std::vector<Loc> find_control_set_candidates(int cx, int cy, int32_t ctrl_set, int max_radius, int &nonempty)
+    {
+        std::vector<Loc> result;
+
+        int radius = 1;
+        nonempty = 0;
+        auto process_location = [&](int x, int y) {
+            if (y < 0 || y > max_y)
+                return;
+            if (x < 0 || x > max_x)
+                return;
+            const auto &tile = control_sets.at(x, y);
+            if (tile.empty())
+                return;
+            ++nonempty;
+            for (int g = 0; g < int(tile.size()); g++) {
+                if (tile.at(g).count > 0 && tile.at(g).ctrl_set == ctrl_set) {
+                    result.emplace_back(x, y, g);
+                }
+            }
+        };
+        process_location(cx, cy);
+        while (radius < max_radius && int(result.size()) < 10) {
+            for (int y = cy - radius; y <= cy + radius; y++) {
+                process_location(cx - radius, y);
+                process_location(cx + radius, y);
+            }
+            for (int x = cx - (radius - 1); x <= cx + (radius - 1); x++) {
+                process_location(x, cy - radius);
+                process_location(x, cy + radius);
+            }
+            ++radius;
+        }
+
+        std::stable_sort(result.begin(), result.end(), [&](Loc a, Loc b) {
+            int d0 = std::abs(a.x - cx) + std::abs(a.y - cy);
+            int d1 = std::abs(b.y - cx) + std::abs(b.y - cy);
+            return d0 < d1;
+        });
+
+        return result;
+    }
+
     // Check if a cell has any meaningful connectivity
     bool has_connectivity(CellInfo *cell)
     {
@@ -482,7 +735,7 @@ class LiquidPlacer
         }
     }
 
-        // This function prepares the equation of each cell for gradient computitation. It's part of the solving step in liquid and depends on build_equations in placer_heap. 
+    // This function prepares the equation of each cell for gradient computitation. It's part of the solving step in liquid and depends on build_equations in placer_heap. 
     void build_cell_equations(bool yaxis){
         
         // Return the x or y position of a cell, depending on ydir
@@ -565,7 +818,7 @@ class LiquidPlacer
         int i = 0;
         std::transform(solve_cells.begin(), solve_cells.end(), std::back_inserter(vals), cell_pos);
         for(auto &cell : solve_cells){ 
-            vals.at(i) += solve(cell, vals.at(i), yaxis);
+            vals.at(i) += solveCell(cell, vals.at(i), yaxis);
             i++;
         }
         for (size_t i = 0; i < vals.size(); i++)
@@ -584,7 +837,7 @@ class LiquidPlacer
             }
     }
 
-    double solve(CellInfo *currentCell, double currentCoordinate, bool yaxis){
+    double solveCell(CellInfo *currentCell, double currentCoordinate, bool yaxis){
         auto legal_pos = [&](CellInfo *cell) { return yaxis ? cell_locs.at(cell->name).legal_y : cell_locs.at(cell->name).legal_x; };
         double  gradient;
         EquationValues eqVal =  solve_cells_equations.at(currentCell->name); 
@@ -594,7 +847,7 @@ class LiquidPlacer
         }else if(eqVal.direction < 0){
             gradient = eqVal.totalNegativeNetSize / eqVal.numNegativeNet;
         }else{
-            return;
+            return 0.0;
         }
         
         if(legalIsInitialize){
@@ -603,29 +856,58 @@ class LiquidPlacer
         
         eqVal.momentum = cfg.betaOne * eqVal.momentum + (1 - cfg.betaOne) * gradient;
         eqVal.speeds = cfg.betaTwo * eqVal.speeds + (1- cfg.betaTwo) * gradient * gradient;
+        solve_cells_equations.at(currentCell->name) = eqVal;
         return learningRate * eqVal.momentum / (std::sqrt(eqVal.speeds) + cfg.eps);
+    }
+
+    void solveInnerIteration(){
+
+        //Reset all equation values
+        initializeNInner();
+
+        //Process all Nets and calculate the equation values
+        build_cell_equations(false);
+        build_cell_equations(true);
+
+        //In first Iteration there exist no previous legalization step and anchor weight is not setted 
+        //After legalization of first step pseudo connections can be used
+        if(anchorWeight != 0.0)legalIsInitialize = true;
+        
+        //Solve and save results
+        solve_equations(false);
+        solve_equations(true);
+    }
+
+    void initializeNInner(){
+        EquationValues initEqVal;
+        initEqVal.direction = 0.0;
+        initEqVal.numPositiveNet = 0;
+        initEqVal.numNegativeNet = 0;
+        initEqVal.totalPositiveNetSize = 0.0;
+        initEqVal.totalNegativeNetSize = 0.0;
+        for(auto &cell : ctx->cells)solve_cells_equations[cell.first] = initEqVal;
     }
 
     void initializeNOuter(int iteration){
         if(iteration > 0){
-            anchorWeight  = std::pow((double)iteration / (numIteration - 1.0), cfg.anchorWeightExponent) * anchorWeight;
+            anchorWeight  = std::pow((double)iteration / (outerIterations - 1.0), cfg.anchorWeightExponent) * anchorWeight;
             learningRate *= learningRateMultiplier;
-            innerItration = std::max(cfg.innerItrEnd,(int)std::round(innerItration/2));
+            innerIteration = std::max(cfg.innerItrEnd,(int)std::round(innerIteration/2));
         }
     }
 
     // Calculate the ratio of used logic blocks. It's the value of 'gamma used' in chapter 'IV. B. Adaptive Maximum Connection Length' of depending paper 
     double ratio_used_logic_blocks(){
         int max_logic_bels = 0, used_logic_bels = 0;
-        for (auto bel : ctx->getBels()){
-            if(ctx->getBelBucketForBel(bel) == id_CPE_LT) max_logic_bels++;
-            if(ctx->getBelBucketForBel(bel) == id_CPE_FF) max_logic_bels++;
-        }
-        for (auto cell : place_cells){
-            if(ctx->getBelBucketForBel(cell->bel) == id_CPE_LT) used_logic_bels++;
-            if(ctx->getBelBucketForBel(cell->bel) == id_CPE_FF) used_logic_bels++;
-        }
+        for (auto bel : ctx->getBels()) if(belHasLogicBlocks(ctx->getBelBucketForBel(bel))) max_logic_bels++;
+        for (auto cell : place_cells) if(belHasLogicBlocks(ctx->getBelBucketForBel(cell->bel))) used_logic_bels++;
+        if(used_logic_bels == 0) return 0;
         return max_logic_bels / used_logic_bels; 
+    }
+
+    bool belHasLogicBlocks(BelBucketId id){
+        for(auto blockType : cfg.logicBlockTypes) if(blockType == id)return true;
+        return false;
     }
 
     double get_net_size_weight(int size) {
@@ -717,6 +999,13 @@ class LiquidPlacer
         return hpwl;
     } 
 
+    // Strict placement legalisation, performed after the initial HeAP spreading
+    void legalise_placement_strict()
+    {
+        StrictLegaliser legaliser(this);
+        legaliser.run();
+    }
+
     template <typename T> T limit_to_reg(Region *reg, T val, bool dir)
     {
         if (reg == nullptr)
@@ -755,7 +1044,7 @@ class LiquidPlacer
     class StrictLegaliser
     {
       public:
-        StrictLegaliser(LiquidPlacer *p) : p(p), ctx(p->ctx) {};
+        StrictLegaliser(PlacerLiquid *p) : p(p), ctx(p->ctx) {};
 
         void run()
         {
@@ -841,7 +1130,7 @@ class LiquidPlacer
                 if (ctrl_set != -1) {
                     int nonempty = 0;
                     int ctrl_set_radius = p->cfg.ctrl_set_max_radius.at(
-                            std::min(p->iter, int(p->cfg.ctrl_set_max_radius.size()) - 1));
+                            std::min(p->iteration, int(p->cfg.ctrl_set_max_radius.size()) - 1));
                     auto candidates =
                             p->find_control_set_candidates(p->cell_locs.at(ci->name).x, p->cell_locs.at(ci->name).y,
                                                            ctrl_set, ctrl_set_radius, nonempty);
@@ -946,7 +1235,7 @@ class LiquidPlacer
         }
 
       private:
-        LiquidPlacer *p;
+        PlacerLiquid *p;
         Context *ctx;
 
         int ripup_radius, chain_ripup_radius, total_iters, total_iters_noreset;
@@ -1167,7 +1456,7 @@ class LiquidPlacer
     class CutSpreader
     {
       public:
-        CutSpreader(LiquidPlacer *p, const pool<BelBucketId> &buckets) : p(p), ctx(p->ctx), buckets(buckets)
+        CutSpreader(PlacerLiquid *p, const pool<BelBucketId> &buckets) : p(p), ctx(p->ctx), buckets(buckets)
         {
             // Get fast BELs data for all buckets being Cut/Spread.
             size_t idx = 0;
@@ -1257,7 +1546,7 @@ class LiquidPlacer
         }
 
       private:
-        LiquidPlacer *p;
+        PlacerLiquid *p;
         Context *ctx;
         pool<BelBucketId> buckets;
         dict<BelBucketId, size_t> type_index;
@@ -1841,14 +2130,12 @@ class LiquidPlacer
     };
     typedef decltype(CellInfo::udata) cell_udata_t;
     cell_udata_t dont_solve = std::numeric_limits<cell_udata_t>::max();
-
-int LiquidPlacer::CutSpreader::seq = 0;
-
     
 };
-bool placer_liquid(Context *ctx, LiquidPlacerCfg cfg) { return LiquidPlacer(ctx, cfg).place(); }
+int PlacerLiquid::CutSpreader::seq = 0;
+bool placer_liquid(Context *ctx, PlacerLiquidCfg cfg) { return PlacerLiquid(ctx, cfg).place(); }
 
-LiquidPlacerCfg::LiquidPlacerCfg(Context *ctx)
+PlacerLiquidCfg::PlacerLiquidCfg(Context *ctx)
 {
     innerItrStart = ctx->setting<int>("placerLiquid/innerIterationStart");
     innerItrEnd = ctx->setting<int>("placerLiquid/innerIterationEnd");

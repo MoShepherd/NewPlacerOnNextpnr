@@ -78,6 +78,7 @@ struct GateMateImpl : HimbaechelAPI
     Loc getRelativeConstraint(Loc &root_loc, IdString id) const;
 
     void configurePlacerHeap(PlacerHeapCfg &cfg) override;
+    void configurePlacerLiquid(PlacerLiquidCfg &cfg) override;
 
     bool isPipInverting(PipId pip) const override;
 
